@@ -1,0 +1,37 @@
+name: Probe — Supabase write patterns
+
+# Manual trigger only. Writes test rows tagged with __probe_test__
+# markers, then deletes them in a finally block. Re-runnable: leftover
+# probe rows from a failed previous run get wiped at start.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      LINNWORKS_APP_ID:      ${{ secrets.LINNWORKS_APP_ID }}
+      LINNWORKS_APP_SECRET:  ${{ secrets.LINNWORKS_APP_SECRET }}
+      LINNWORKS_TOKEN:       ${{ secrets.LINNWORKS_TOKEN }}
+      SQUARE_ACCESS_TOKEN:   ${{ secrets.SQUARE_ACCESS_TOKEN }}
+      SQUARE_APPLICATION_ID: ${{ secrets.SQUARE_APPLICATION_ID }}
+      SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY:  ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probe
+        run: python -m probes.probe_supabase_write_pattern
