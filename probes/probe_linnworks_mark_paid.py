@@ -5,10 +5,11 @@ Square already took the money at the till, so the new Linnworks order
 must be marked **paid** but **not dispatched** (Kevin processes
 dispatch manually after-hours).
 
-This probe finds the mechanism. It creates a real test order using
-the same body-shape strategy as `probe_linnworks_create_order.py`,
-captures a baseline of payment-related fields via
-`Orders/GetOrdersById`, then tries each candidate path:
+This probe finds the mechanism. It creates a real test order via
+`Orders/CreateOrders` using the canonical wire format from
+`probe_linnworks_create_orders.py` (probe 3 v2), captures a baseline
+of payment-related fields via `Orders/GetOrdersById`, then tries each
+candidate path:
 
 - `Orders/SetPaymentStatus` (multiple body-shape variants)
 - `Orders/AddOrderPayment` (the "record a payment" path used in the
@@ -22,8 +23,9 @@ The probe also asserts the order **didn't** flip to a dispatched /
 processed state — that would be a different (and unwanted) path.
 
 Cleanup: the test order is deleted in a finally block via the same
-logic as `probe_linnworks_create_order.py`. If cleanup fails the
-orphan pkOrderID is printed loudly.
+logic as `probe_linnworks_create_orders.py`. If cleanup fails the
+orphan pkOrderID is printed loudly with all the marker fields you can
+search by.
 """
 
 from __future__ import annotations
@@ -36,14 +38,13 @@ from typing import Any, Optional
 import requests
 
 from lib import linnworks
-from probes.probe_linnworks_create_order import (
+from probes.probe_linnworks_create_orders import (
     PROBE_SKU_MARKER,
     _attempt_cleanup,
-    _candidate_create_bodies,
-    _customer_marker,
-    _extract_pk_order_id,
-    _get_default_location_id,
     _try_call,
+    _utc_timestamp,
+    create_test_order_via_create_orders,
+    _list_locations,
 )
 
 
@@ -102,24 +103,20 @@ def _diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, tuple[Any,
     }
 
 
-def _create_test_order(location_id: str) -> Optional[str]:
-    """Reuse probe 2's candidate body shapes to create a test order.
-    Returns the pkOrderID or None if every shape fails.
+def _create_test_order() -> tuple[Optional[str], str]:
+    """Use probe 3 v2's canonical Orders/CreateOrders wire format to
+    create one test order. Returns (pkOrderID, timestamp_used) — the
+    timestamp is needed for the orphan-recovery banner so the manual
+    search markers match what's on the order.
     """
-    for label, body in _candidate_create_bodies(location_id):
-        result, status, err = _try_call(
-            "Orders/CreateNewOrder",
-            body=body,
-            label=f"CreateNewOrder — {label}",
+    timestamp = _utc_timestamp()
+    pk, working_attempt = create_test_order_via_create_orders(timestamp)
+    if pk:
+        print(
+            f"=== DISCOVERY: test order created via {working_attempt!r}, pkOrderID = {pk} ==="
         )
-        if status != 200 or result is None:
-            continue
-        pk = _extract_pk_order_id(result)
-        if pk:
-            print(f"=== DISCOVERY: test order created via shape {label!r}, pkOrderID = {pk} ===")
-            print(f"!!! TEST ORDER pkOrderID = {pk} — manual cleanup id if needed !!!")
-            return pk
-    return None
+        print(f"!!! TEST ORDER pkOrderID = {pk} — manual cleanup id if needed !!!")
+    return (pk, timestamp)
 
 
 def _candidate_mark_paid_calls(pk_order_id: str) -> list[tuple[str, str, dict[str, Any]]]:
@@ -211,21 +208,26 @@ def _looks_dispatched(snapshot: dict[str, Any]) -> bool:
 def main() -> int:
     print("--- probe_linnworks_mark_paid ---")
 
-    location_id = _get_default_location_id()
-    if not location_id:
-        print("=== DISCOVERY: could not determine a stock location — cannot proceed ===")
-        return 1
+    # Visibility only — DEFAULT_LOCATION_ID is hardcoded in the
+    # CreateOrders helper. We log the live list so a tenant change
+    # would be obvious in the run log.
+    _list_locations()
 
     pk_order_id: Optional[str] = None
+    timestamp: str = ""
     working_label: Optional[str] = None
     working_path: Optional[str] = None
     working_body: Optional[dict[str, Any]] = None
     final_dispatched = False
 
     try:
-        pk_order_id = _create_test_order(location_id)
+        pk_order_id, timestamp = _create_test_order()
         if not pk_order_id:
-            print("=== DISCOVERY: could not create a test order. Run probe 2 first to lock in CreateNewOrder shape. ===")
+            print(
+                "=== DISCOVERY: could not create a test order via Orders/CreateOrders. "
+                "Run probe 3 (probe-linnworks-create-orders) first to lock in the "
+                "working wire format, then re-run this probe. ==="
+            )
             return 2
 
         baseline_order = _read_order(pk_order_id)
@@ -290,9 +292,10 @@ def main() -> int:
                     f"\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
                     f"!!! CLEANUP FAILED — orphan order pkOrderID:    !!!\n"
                     f"!!!   {pk_order_id}\n"
-                    f"!!! Find it in Linnworks UI by searching customer\n"
-                    f"!!! name beginning '[PROBE-CLEANUP-FAILED-' or\n"
-                    f"!!! line-item SKU '{PROBE_SKU_MARKER}'\n"
+                    f"!!! Find it in Linnworks UI by searching for\n"
+                    f"!!!   reference number = __PROBE_TEST_{timestamp}__\n"
+                    f"!!!   or customer name '[PROBE-CLEANUP-FAILED-...'\n"
+                    f"!!!   or line-item SKU '{PROBE_SKU_MARKER}'\n"
                     f"!!! and delete it manually before re-running.\n"
                     f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
                 )

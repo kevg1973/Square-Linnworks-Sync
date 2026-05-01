@@ -14,7 +14,7 @@ else. Findings are pasted into `DISCOVERIES.md` at the repo root.
 | Script | Workflow | What it probes |
 |---|---|---|
 | `probe_square_scopes.py` | `probe-square-scopes.yml` | Whether the Square access token has the six scopes we need (`ITEMS_READ/WRITE`, `INVENTORY_READ/WRITE`, `ORDERS_READ`, plus location read). Side-effect-free — never modifies data. |
-| `probe_linnworks_create_order.py` | `probe-linnworks-create-order.yml` | The body shape that `Orders/CreateNewOrder` accepts on this tenant. Creates a real test order, prints the `pkOrderID`, then deletes it in a `finally` block. |
+| `probe_linnworks_create_orders.py` | `probe-linnworks-create-orders.yml` | The wire format that `Orders/CreateOrders` (plural) accepts on this tenant, with all mandatory fields filled in. Creates a real test order, prints the `pkOrderID`, then deletes it in a `finally` block. v1 (`probe_linnworks_create_order.py`, singular) targeted `Orders/CreateNewOrder` — wrong endpoint — and is kept as a deprecation stub. |
 | `probe_linnworks_mark_paid.py` | `probe-linnworks-mark-paid.yml` | The mechanism for marking an order as paid without dispatching. Creates a test order, tries each candidate path, verifies via readback, then deletes the order. |
 | `probe_supabase_write_pattern.py` | `probe-supabase-write-pattern.yml` | The four supabase-py write patterns used in production: upsert with `on_conflict`, batch insert with `jsonb`, watermark round-trip, filtered query. Cleans up its own rows. |
 

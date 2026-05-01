@@ -60,18 +60,38 @@ GitHub secret when Phase 2 (stock-push) lands.
 
 ---
 
-## 3. Linnworks `Orders/CreateNewOrder` body shape
+## 3. Linnworks `Orders/CreateOrders` body shape
 
-**Probe**: `probes/probe_linnworks_create_order.py`
-**Workflow**: `.github/workflows/probe-linnworks-create-order.yml`
+**Probe**: `probes/probe_linnworks_create_orders.py` (v2)
+**Workflow**: `.github/workflows/probe-linnworks-create-orders.yml`
 **Status**: [run probe to populate]
 
-Per §10 of `LINNWORKS_REFERENCE.md`, the body shape for
-`Orders/CreateNewOrder` is tenant-dependent and the public docs are
-stale. The probe tries multiple candidate shapes and locks in the one
-that returns 200 with a `pkOrderID` on Northwest Guitars' tenant.
+The v1 probe (`probes/probe_linnworks_create_order.py`, deprecated and
+kept as a stub) targeted the wrong endpoint: `Orders/CreateNewOrder`
+creates an empty draft order, not the fully-formed order we need.
+v2 targets `Orders/CreateOrders` (plural) with all documented
+mandatory fields per
+https://help.linnworks.com/support/solutions/articles/7000013635 :
 
-**Working shape**: [run probe — paste the JSON body that returned 200]
+- `Source`           = "DIRECT"
+- `SubSource`        = "PROBE_TEST" (probe) / "SQUARE_POS" (production)
+- `ReferenceNumber`  = unique-per-source-and-subsource string (Linnworks dedupes on this)
+- `ReceivedDate`     = ISO datetime
+- `DispatchBy`       = ISO datetime, > now
+- `OrderItems`       = array of `{SKU, Qty, PricePerUnit, ItemTitle, ...}`
+- `DeliveryAddress`  = address dict (note: must be named `DeliveryAddress`, NOT `ShippingAddress`)
+- `BillingAddress`   = same shape as DeliveryAddress
+- `LocationId`       = stock-location UUID
+- `Currency`         = "GBP"
+
+The probe tries the JSON wire format first, then falls back to
+form-encoded `orders=<json string of array>`. Every full request and
+response body is logged so 400 details are readable.
+
+**Working wire format**: [run probe — paste the attempt label]
+
+**Working order body** (mandatory fields filled in): [run probe to
+populate]
 
 ```json
 [run probe to populate]
@@ -80,8 +100,8 @@ that returns 200 with a `pkOrderID` on Northwest Guitars' tenant.
 **Response shape** (key path to `pkOrderID`): [run probe to populate]
 
 **Cleanup endpoint** (probe deletes its own test orders): [run probe
-to populate — typically `Orders/DeleteOrders` with
-`{"orderIds": ["<uuid>"]}`]
+to populate — first candidate tried is `Orders/DeleteOrder` with
+`{"orderId": "<uuid>"}`]
 
 ---
 

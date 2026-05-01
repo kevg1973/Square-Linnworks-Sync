@@ -1,10 +1,13 @@
-name: Probe — Linnworks CreateNewOrder shape
+name: Probe — Linnworks CreateOrders shape
 
-# Manual trigger only. Creates ONE real Linnworks order, captures the
-# working body shape, then deletes the test order in a finally block.
+# Manual trigger only. Creates ONE real Linnworks order via
+# Orders/CreateOrders (plural — the v2 of probe 3, after v1's
+# CreateNewOrder turned out to be the wrong endpoint), captures the
+# working wire format, then deletes the test order in a finally block.
 # If cleanup fails, the workflow log will print the orphan pkOrderID
-# loudly — search Linnworks UI for the customer-name marker
-# `[PROBE-CLEANUP-FAILED-...]` to find and delete it manually.
+# in a banner — search Linnworks UI for the customer-name marker
+# `[PROBE-CLEANUP-FAILED-...]` or the reference number marker
+# `__PROBE_TEST_*__` to find and delete it manually.
 on:
   workflow_dispatch:
 
@@ -36,4 +39,4 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run probe
-        run: python -m probes.probe_linnworks_create_order
+        run: python -m probes.probe_linnworks_create_orders
