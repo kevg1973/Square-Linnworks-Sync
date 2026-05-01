@@ -1,0 +1,39 @@
+name: Probe — Linnworks CreateNewOrder shape
+
+# Manual trigger only. Creates ONE real Linnworks order, captures the
+# working body shape, then deletes the test order in a finally block.
+# If cleanup fails, the workflow log will print the orphan pkOrderID
+# loudly — search Linnworks UI for the customer-name marker
+# `[PROBE-CLEANUP-FAILED-...]` to find and delete it manually.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      LINNWORKS_APP_ID:      ${{ secrets.LINNWORKS_APP_ID }}
+      LINNWORKS_APP_SECRET:  ${{ secrets.LINNWORKS_APP_SECRET }}
+      LINNWORKS_TOKEN:       ${{ secrets.LINNWORKS_TOKEN }}
+      SQUARE_ACCESS_TOKEN:   ${{ secrets.SQUARE_ACCESS_TOKEN }}
+      SQUARE_APPLICATION_ID: ${{ secrets.SQUARE_APPLICATION_ID }}
+      SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY:  ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probe
+        run: python -m probes.probe_linnworks_create_order
