@@ -149,8 +149,8 @@ deliverable that can be tested before the next is built on top.
 
 | Phase | What | Status |
 |---|---|---|
-| **0a** | Repo skeleton + auth smoke test | this commit |
-| 0b | Diagnostic probes for the four unknowns | not started |
+| **0a** | Repo skeleton + auth smoke test | ✅ complete (2026-05-01) |
+| 0b | Diagnostic probes for the four unknowns | in progress |
 | 1 | Reconciliation report (read-only, both APIs) | not started |
 | 2 | Stock-push cron (Linnworks → Square, write to Square) | not started |
 | 3 | Order-pull cron (Square → Linnworks, write to Linnworks) | not started |
@@ -178,6 +178,25 @@ deliverable that can be tested before the next is built on top.
 
 If the smoke test passes, all credentials are wired correctly and we
 can start Phase 0b.
+
+## Phase 0a — completed (2026-05-01)
+
+The smoke test workflow ran green on 2026-05-01:
+
+- **Linnworks auth** — install token exchanged, session token + cluster
+  URL returned. Tenant cluster confirmed as the EU cluster.
+- **Square auth** — `/v2/locations` returned a non-zero list. The
+  physical-shop location for inventory writes is **`L74KSP08AJ2GH`**
+  (Northwest Guitars). This is the location ID we'll pin for all
+  inventory operations from Phase 2 onward. (Will be promoted to a
+  `SQUARE_LOCATION_ID` env var when stock-push lands; for now the
+  probes derive it at runtime from `/v2/locations`.)
+- **Supabase round-trip** — wrote a `smoke-test` row into
+  `sq_sync_runs`, marked it finished, read it back. Service-role key
+  has full access to the `sq_*` tables.
+
+All seven repository secrets are wired correctly. Cleared to start
+Phase 0b.
 
 ## Phase 0b — known unknowns to probe
 
