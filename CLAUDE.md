@@ -150,7 +150,7 @@ deliverable that can be tested before the next is built on top.
 | Phase | What | Status |
 |---|---|---|
 | **0a** | Repo skeleton + auth smoke test | ✅ complete (2026-05-01) |
-| 0b | Diagnostic probes for the four unknowns | in progress |
+| 0b | Diagnostic probes for the four unknowns | 3 of 4 complete (mark-paid deferred — endpoint discovery needed) |
 | 1 | Reconciliation report (read-only, both APIs) | not started |
 | 2 | Stock-push cron (Linnworks → Square, write to Square) | not started |
 | 3 | Order-pull cron (Square → Linnworks, write to Linnworks) | not started |
@@ -228,6 +228,80 @@ Each probe is a standalone Python script in `probes/`, runnable via
 its own `workflow_dispatch` workflow. Output goes to `DISCOVERIES.md`
 which is committed back to the repo as a permanent record of what
 shape works on Kevin's tenant.
+
+## Linnworks tenant facts (discovered)
+
+Locked-in by Phase 0b probes against the live Northwest Guitars
+tenant. `DISCOVERIES.md` has the full evidence; this is the
+production-code-relevant summary.
+
+### `Orders/CreateOrders` — the create-an-order endpoint
+
+- **Path**: `POST /api/Orders/CreateOrders` (plural — `CreateNewOrder`,
+  singular, creates empty drafts and is the wrong endpoint).
+- **Wire format**: JSON body `{"orders": [<order>]}`. Array under the
+  `orders` key, even for a single order.
+- **Response**: a bare JSON array of pkOrderID strings, e.g.
+  `["98c01c1a-cdfd-46f2-9bce-4c19d268bbe0"]` — **not** wrapped in
+  `{Orders: [...]}` or `{Data: [...]}`.
+- **Required fields on the order**: `Source`, `SubSource`,
+  `ReferenceNumber`, `ExternalReferenceNumber`, `ReceivedDate`,
+  `DispatchBy`, `LocationId`, `Currency`, `OrderItems` (array of
+  `{SKU, ChannelSKU, ItemTitle, ItemNumber, Qty, PricePerUnit,
+  Discount, LineDiscount, TaxRate}`), `DeliveryAddress`,
+  `BillingAddress`. The address must be named `DeliveryAddress` —
+  NOT `ShippingAddress`. (That single rename was the silent 400 cause
+  on v1.)
+- **Dedup key**: `(Source, SubSource, ReferenceNumber)`. Re-submitting
+  the same triple returns the same `pkOrderID`. The Phase 3 order-pull
+  cron should derive `ReferenceNumber` deterministically from Square's
+  order id so retries are naturally idempotent.
+
+### `Orders/DeleteOrder` — the cleanup endpoint
+
+`POST /api/Orders/DeleteOrder` (singular) with body
+`{"orderId": "<pkOrderID uuid>"}`. Returns 200. Used by the probes
+for self-cleanup; production code shouldn't normally need it.
+
+### `IsParked: true` on direct-source orders
+
+Orders created via `Orders/CreateOrders` with `Source = "DIRECT"`
+land **parked** (`IsParked: true` on the readback). Parked orders
+sit outside Linnworks' normal dispatch flow. Phase 3 design will
+likely need to unpark before the order is visible in Kevin's normal
+"open orders" view — endpoint TBD (research with mark-paid; see
+"Known unknowns").
+
+### Stock locations on this tenant
+
+Three in total. The one used for Square→Linnworks orders:
+
+- **Default** — `StockLocationId = 00000000-0000-0000-0000-000000000000`,
+  `IsFulfillmentCenter = false`.
+
+The other two are visible in any probe-3 workflow log under the
+`=== DISCOVERY: 3 stock location(s) on tenant ===` line; not on the
+critical path for Phases 1–3.
+
+## Known unknowns
+
+Things we still need to figure out before the next phase can land.
+Each entry names the pre-requisite work and where to look first.
+
+- **Mark-as-paid endpoint.** Phase 3 (order-pull) blocks on this.
+  The Phase 0b mark-paid probe attempted six request shapes across
+  four endpoint paths (`Orders/SetPaymentStatus`,
+  `Orders/AddOrderPayment`, `Orders/SetOrderPayment`,
+  `Orders/PayOrder`); **all four returned HTTP 404** on this tenant.
+  Don't re-test those next session.
+  **Action before next probe attempt**: research the actual mark-as-
+  paid endpoint at apidocs.linnworks.net. Likely candidates to look
+  for: an unpark endpoint (since direct-source orders are
+  `IsParked: true` and parked orders may not accept payment writes),
+  endpoints under `Payments/` or `OrderPayments/`, or a
+  `ProcessedOrders/` path even though our orders aren't processed.
+  Update `DISCOVERIES.md` §4 with new candidate names *before*
+  writing more probe attempts.
 
 ## Required env vars / GitHub Actions secrets
 
