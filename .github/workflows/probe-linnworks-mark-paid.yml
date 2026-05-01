@@ -1,0 +1,38 @@
+name: Probe — Linnworks mark-as-paid mechanism
+
+# Manual trigger only. Creates ONE real Linnworks order, tries each
+# candidate "mark as paid" path, verifies via readback, then deletes
+# the test order in a finally block. Same orphan-recovery markers as
+# probe-linnworks-create-order.yml.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      LINNWORKS_APP_ID:      ${{ secrets.LINNWORKS_APP_ID }}
+      LINNWORKS_APP_SECRET:  ${{ secrets.LINNWORKS_APP_SECRET }}
+      LINNWORKS_TOKEN:       ${{ secrets.LINNWORKS_TOKEN }}
+      SQUARE_ACCESS_TOKEN:   ${{ secrets.SQUARE_ACCESS_TOKEN }}
+      SQUARE_APPLICATION_ID: ${{ secrets.SQUARE_APPLICATION_ID }}
+      SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY:  ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probe
+        run: python -m probes.probe_linnworks_mark_paid
