@@ -286,7 +286,7 @@ def main() -> int:
     finally:
         if pk_order_id:
             print(f"\n--- cleanup: deleting test order {pk_order_id} ---")
-            cleaned = _attempt_cleanup(pk_order_id)
+            cleaned, working_path = _attempt_cleanup(pk_order_id)
             if not cleaned:
                 print(
                     f"\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
@@ -300,7 +300,7 @@ def main() -> int:
                     f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
                 )
                 return 4
-            print(f"=== DISCOVERY: test order {pk_order_id} cleaned up successfully ===")
+            print(f"=== DISCOVERY: cleanup via {working_path} succeeded ===")
 
     if final_dispatched and not working_path:
         return 5
