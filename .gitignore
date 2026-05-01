@@ -1,0 +1,30 @@
+# Secrets — never commit
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.python-version
+
+# OS
+.DS_Store
+._*
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local probe / scratch output
+probes/output/
+discoveries-draft.md
+
+# Workflow run artefacts (we download these manually, don't commit)
+*.csv
+!supabase/*.csv

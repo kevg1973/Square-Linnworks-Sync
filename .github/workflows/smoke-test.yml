@@ -1,0 +1,75 @@
+name: Smoke Test
+
+# Manual trigger only. No cron yet — that comes in Phase 2 / 3.
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      LINNWORKS_APP_ID:     ${{ secrets.LINNWORKS_APP_ID }}
+      LINNWORKS_APP_SECRET: ${{ secrets.LINNWORKS_APP_SECRET }}
+      LINNWORKS_TOKEN:      ${{ secrets.LINNWORKS_TOKEN }}
+      SQUARE_ACCESS_TOKEN:  ${{ secrets.SQUARE_ACCESS_TOKEN }}
+      SQUARE_APPLICATION_ID: ${{ secrets.SQUARE_APPLICATION_ID }}
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Smoke test — Linnworks auth
+        run: |
+          python - <<'EOF'
+          from lib import linnworks
+          result = linnworks.smoke_test()
+          print("Linnworks OK:", result)
+          assert result["authenticated"] is True
+          assert result["server"].startswith("https://"), \
+              f"Expected https server URL, got {result['server']!r}"
+          EOF
+
+      - name: Smoke test — Square auth
+        run: |
+          python - <<'EOF'
+          from lib import square
+          result = square.smoke_test()
+          print("Square OK — locations found:", result["location_count"])
+          for name, loc_id in zip(result["location_names"], result["location_ids"]):
+              print(f"  • {name}  ({loc_id})")
+          assert result["authenticated"] is True
+          assert result["location_count"] >= 1, "Expected at least one Square location"
+          EOF
+
+      - name: Smoke test — Supabase round-trip
+        run: |
+          python - <<'EOF'
+          from lib import db
+          result = db.smoke_test()
+          print("Supabase OK:", result)
+          assert result["round_trip_ok"] is True
+          assert result["row"]["status"] == "success"
+          EOF
+
+      - name: All checks passed
+        run: |
+          echo ""
+          echo "================================"
+          echo "  ✓ Phase 0a smoke test passed."
+          echo "================================"
+          echo ""
+          echo "All three credential sets are wired correctly."
+          echo "Ready to proceed to Phase 0b (diagnostic probes)."
