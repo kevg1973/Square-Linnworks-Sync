@@ -1,4 +1,4 @@
-"""probes/probe_linnworks_mark_paid.py — Phase 0b probe (v4).
+"""probes/probe_linnworks_mark_paid.py — Phase 0b probe (v5).
 
 Order-pull (Phase 3) creates Linnworks orders from Square POS sales.
 Square already took the money at the till, so the new Linnworks order
@@ -21,7 +21,15 @@ which looked like the call was being silently ignored.
 capture) but used `Orders/SetOrderParkedStatus` for the unpark step
 — that endpoint doesn't exist on this tenant and 404'd.
 
-## What v4 does — both endpoints captured from UI traffic
+**v4** swapped to `Orders/ChangeOrderTag` (also captured from the
+UI). The unpark call actually succeeded (HTTP 200, readback showed
+the order unparked) but the probe's verification logic bailed out
+because the snapshot didn't capture `GeneralInfo.IsParked` — only
+top-level `IsParked` (which doesn't exist), so the diff was empty
+and the success check `snapshot.get("IsParked") is not False` was
+True (None is not False). v5 fixes the verification.
+
+## What v5 does — same recipe, fixed verification
 
 Kevin captured the actual HTTP request the Linnworks dashboard fires
 when a user clicks **Actions → Change status → Paid** in the UI:
@@ -117,6 +125,7 @@ def _payment_snapshot(order: dict[str, Any]) -> dict[str, Any]:
 
     for key in (
         "Status", "SubStatus", "IsPaid", "Paid", "PaymentStatus",
+        "IsParked",  # v4 missed this — IsParked actually lives at GeneralInfo.IsParked, not top-level
         "ReceivedDate", "Processed", "DispatchedDate",
     ):
         if key in general:
@@ -139,6 +148,17 @@ def _diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, tuple[Any,
         for k in sorted(keys)
         if before.get(k) != after.get(k)
     }
+
+
+def _is_parked(snapshot: dict[str, Any]) -> bool:
+    """True only if the snapshot explicitly says the order is still parked.
+    Absence of the field is treated as not-parked (we don't bail on
+    missing data — only on an explicit `True`).
+    """
+    return (
+        snapshot.get("GeneralInfo.IsParked") is True
+        or snapshot.get("IsParked") is True
+    )
 
 
 # ---------- the two targeted form-encoded calls ----------
@@ -213,7 +233,7 @@ def _create_test_order() -> tuple[Optional[str], str]:
 
 
 def main() -> int:
-    print("--- probe_linnworks_mark_paid (v4 — unpark via ChangeOrderTag, mark paid via ChangeStatus) ---")
+    print("--- probe_linnworks_mark_paid (v5 — fixed verification, snapshot now sees GeneralInfo.IsParked) ---")
 
     _list_locations()
 
@@ -259,13 +279,15 @@ def main() -> int:
             return 8
 
         after_unpark = _verify(pk_order_id, baseline, "after step 1 (unpark)")
-        if after_unpark is None or after_unpark.get("IsParked") is not False:
+        if after_unpark is None:
+            return 9
+        if _is_parked(after_unpark):
             print(
-                "=== DISCOVERY: ChangeOrderTag returned 200 but IsParked did not flip "
-                "to false. Re-capture the unpark request from the UI to confirm body. ==="
+                "=== DISCOVERY: ChangeOrderTag returned 200 but IsParked is still True. "
+                "Re-capture the unpark request from the UI to confirm body. ==="
             )
             return 9
-        print("=== DISCOVERY: step 1 OK — order is now unparked (IsParked: false) ===")
+        print("=== DISCOVERY: step 1 OK — order is now unparked (IsParked is no longer True) ===")
 
         # ---------- Step 2 — mark paid ----------
         print("\n--- step 2: mark paid via Orders/ChangeStatus (form-encoded, status=1) ---")
