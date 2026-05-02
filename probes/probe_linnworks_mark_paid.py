@@ -1,57 +1,65 @@
-"""probes/probe_linnworks_mark_paid.py — Phase 0b probe.
+"""probes/probe_linnworks_mark_paid.py — Phase 0b probe (v3).
 
 Order-pull (Phase 3) creates Linnworks orders from Square POS sales.
 Square already took the money at the till, so the new Linnworks order
 must be marked **paid** but **not dispatched** (Kevin processes
 dispatch manually after-hours).
 
-## Background — what's been ruled out
+## What the previous attempts taught us
 
-The first attempt (committed in 9a36491 / 830954d) fired six request
-shapes across four endpoint paths — `Orders/SetPaymentStatus`,
-`Orders/AddOrderPayment`, `Orders/SetOrderPayment`, `Orders/PayOrder`.
-**All four returned HTTP 404 on this tenant.** Those names don't
-exist; do not re-test them.
+**v1** fired six request shapes across four endpoint paths —
+`Orders/SetPaymentStatus`, `Orders/AddOrderPayment`,
+`Orders/SetOrderPayment`, `Orders/PayOrder`. **All four returned
+HTTP 404.** Those names don't exist; never re-test them.
 
-## What this v2 probe does
+**v2** identified `Orders/ChangeStatus` (status enum 1=PAID) as the
+documented mark-as-paid endpoint and tried it as JSON. The endpoint
+returned HTTP 200 but the order's `GeneralInfo.Status` did not flip,
+which looked like the call was being silently ignored.
 
-Researched the live Linnworks API reference (apidocs.linnworks.net)
-to identify the canonical mark-as-paid endpoint:
+## What v3 does — confirmed by capturing UI traffic
 
-- **`Orders/ChangeStatus`** is the documented endpoint, body
-  `{"orderIds": [<uuid>], "status": <int>}` with the status enum
-  `0=UNPAID, 1=PAID, 2=RETURN, 3=PENDING, 4=RESEND`. Source:
-  https://apidocs.linnworks.net/reference/changestatus .
+Kevin captured the actual HTTP request the Linnworks dashboard fires
+when a user clicks **Actions → Change status → Paid** in the UI:
 
-The complication is that `Orders/CreateOrders` lands `Source=DIRECT`
-orders **parked** (`IsParked: true` per probe 3's readback). Parked
-orders may reject status changes outright, so the probe is structured
-as three targeted, sequential attempts:
+- **Endpoint**: `POST /api/Orders/ChangeStatus`
+- **Encoding**: `application/x-www-form-urlencoded`, **not JSON**.
+  v2's JSON request returned 200 but did nothing — Linnworks' router
+  silently no-ops unrecognised body shapes on this endpoint.
+- **Form fields**:
+    - `orderIds` = literal string `["<uuid>"]` — i.e. a JSON-encoded
+      array of UUIDs serialised into the form value, then URL-encoded
+      by the HTTP client. Same trick as
+      `Dashboards/ExecuteCustomPagedScript`'s `parameters` field per
+      LINNWORKS_REFERENCE.md §6.
+    - `status` = `1` (the enum: `0` = Unpaid, `1` = Paid, confirmed
+      against the UI).
 
-1. **A — `Orders/ChangeStatus` (status=1)** directly. If this works on
-   a parked order (Linnworks support docs hint that channel orders
-   auto-unpark on payment update), we're done in one call.
+Orders created via `Orders/CreateOrders` with `Source = "DIRECT"`
+land **parked** (`IsParked: true` per probe 3). On a parked order
+`ChangeStatus` is silently ignored. So v3 is structured as a
+two-step recipe:
 
-2. **B — `Orders/SetOrderParkedStatus` (isParked=false)** if A didn't
-   take. Endpoint exists in the URL space (apps.linnworks.net redirects
-   `/Api/Method/Orders-SetOrderParkedStatus` to its readme.io ref); body
-   shape inferred from the consistent Linnworks pattern of
-   `{"orderIds": [<uuid>], ...}`.
+1. **Unpark** via `Orders/SetOrderParkedStatus`, form-encoded
+   `orderIds=["<uuid>"]&isParked=false`. Verify by readback that
+   `IsParked` flipped to `false`. (Body shape inferred — same form
+   field convention as `ChangeStatus`. If this still 404s the
+   endpoint name is wrong and we'll need to capture it from the UI
+   too. Don't burn more guesses.)
+2. **Mark paid** via `Orders/ChangeStatus`, form-encoded
+   `orderIds=["<uuid>"]&status=1`. Verify by readback that
+   `GeneralInfo.Status` flipped to `1` AND `Processed` stayed
+   `false` (we want paid, not dispatched).
 
-3. **C — `Orders/ChangeStatus` (status=1)** retry, after B unparked
-   the order.
-
-Each attempt verifies success by reading the order back via
-`Orders/GetOrdersById` and diffing the payment snapshot against the
-baseline. The probe also asserts the order **didn't** flip to a
-dispatched / processed state.
+If both verifications pass, the recipe is locked in and DISCOVERIES.md
+§4 gets updated.
 
 ## Cleanup
 
 The test order is deleted in a finally block via the same logic as
 `probe_linnworks_create_orders.py`. If cleanup fails the orphan
-pkOrderID is printed loudly with all the marker fields you can search
-by.
+pkOrderID is printed loudly with all the marker fields you can
+search by.
 """
 
 from __future__ import annotations
@@ -77,7 +85,7 @@ def _read_order(pk_order_id: str) -> Optional[dict[str, Any]]:
     """Hydrate the order via `Orders/GetOrdersById` and return the
     single-order dict. Returns None on read failure.
     """
-    result, status, err = _try_call(
+    result, status, _ = _try_call(
         "Orders/GetOrdersById",
         body={"pkOrderIds": [pk_order_id]},
         label=f"read back order {pk_order_id[:8]}…",
@@ -100,12 +108,10 @@ def _payment_snapshot(order: dict[str, Any]) -> dict[str, Any]:
     totals = order.get("TotalsInfo", {}) if isinstance(order.get("TotalsInfo"), dict) else {}
     snapshot: dict[str, Any] = {}
 
-    # Top-level — IsParked lives here on this tenant per probe 3.
     for key in ("IsParked", "Processed", "DispatchedDate"):
         if key in order:
             snapshot[key] = order[key]
 
-    # GeneralInfo — Status enum and payment-state flags
     for key in (
         "Status", "SubStatus", "IsPaid", "Paid", "PaymentStatus",
         "ReceivedDate", "Processed", "DispatchedDate",
@@ -113,7 +119,6 @@ def _payment_snapshot(order: dict[str, Any]) -> dict[str, Any]:
         if key in general:
             snapshot[f"GeneralInfo.{key}"] = general[key]
 
-    # TotalsInfo — money + payment method UUID
     for key in (
         "TotalCharge", "TotalPaid", "TotalDiscount", "Currency",
         "PaymentMethod", "PaymentMethodId",
@@ -133,49 +138,60 @@ def _diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, tuple[Any,
     }
 
 
-def _looks_paid(snapshot: dict[str, Any]) -> bool:
-    """'paid' state per the snapshot fields. Returns True if any of the
-    typical paid-indicator fields are set. Status==1 is the
-    Orders/ChangeStatus enum value for PAID per
-    https://apidocs.linnworks.net/reference/changestatus .
+# ---------- the two targeted form-encoded calls ----------
+
+
+def _form_orderids(pk_order_id: str) -> str:
+    """Form-field value for `orderIds`: a JSON-encoded array as a
+    string. The brackets and quotes ARE part of the value; requests
+    URL-encodes the whole thing on the wire. Same shape as the
+    Linnworks dashboard sends.
     """
-    status = snapshot.get("GeneralInfo.Status")
-    if status == 1 or status == "1":
-        return True
-    if snapshot.get("GeneralInfo.IsPaid") is True:
-        return True
-    if snapshot.get("IsPaid") is True:
-        return True
-    payment_status = snapshot.get("GeneralInfo.PaymentStatus")
-    if isinstance(payment_status, str) and payment_status.lower() in {"paid", "fullypaid", "completed"}:
-        return True
-    total_charge = snapshot.get("TotalsInfo.TotalCharge")
-    total_paid = snapshot.get("TotalsInfo.TotalPaid")
-    if total_charge is not None and total_paid is not None:
-        try:
-            if float(total_paid) > 0 and float(total_paid) >= float(total_charge):
-                return True
-        except (TypeError, ValueError):
-            pass
-    return False
+    return json.dumps([pk_order_id])
 
 
-def _looks_dispatched(snapshot: dict[str, Any]) -> bool:
-    """We do NOT want the order to flip to dispatched/processed."""
-    if snapshot.get("Processed") is True:
-        return True
-    if snapshot.get("GeneralInfo.Processed") is True:
-        return True
-    if snapshot.get("DispatchedDate") and str(snapshot["DispatchedDate"]).startswith(("2", "1")):
-        return True
-    return False
+def _attempt_unpark(pk_order_id: str) -> int:
+    """POST Orders/SetOrderParkedStatus form-encoded. Returns HTTP status."""
+    form = {
+        "orderIds": _form_orderids(pk_order_id),
+        "isParked": "false",
+    }
+    _, status, _ = _try_call(
+        "Orders/SetOrderParkedStatus",
+        form_body=form,
+        label="unpark via Orders/SetOrderParkedStatus (form-encoded)",
+    )
+    return status
 
 
-def _looks_unparked(snapshot: dict[str, Any]) -> bool:
-    return snapshot.get("IsParked") is False
+def _attempt_change_status_paid(pk_order_id: str) -> int:
+    """POST Orders/ChangeStatus form-encoded with status=1 (Paid).
+    Returns HTTP status.
+    """
+    form = {
+        "orderIds": _form_orderids(pk_order_id),
+        "status": "1",
+    }
+    _, status, _ = _try_call(
+        "Orders/ChangeStatus",
+        form_body=form,
+        label="mark paid via Orders/ChangeStatus (form-encoded, status=1)",
+    )
+    return status
 
 
-# ---------- test order + the 3 targeted attempts ----------
+def _verify(pk_order_id: str, baseline: dict[str, Any], stage_label: str) -> Optional[dict[str, Any]]:
+    after_order = _read_order(pk_order_id)
+    if not after_order:
+        print(f"    [{stage_label}] readback failed — cannot verify")
+        return None
+    after = _payment_snapshot(after_order)
+    changes = _diff(baseline, after)
+    print(f"    [{stage_label}] fields that changed since baseline: {json.dumps(changes, default=str)}")
+    return after
+
+
+# ---------- main flow ----------
 
 
 def _create_test_order() -> tuple[Optional[str], str]:
@@ -189,61 +205,21 @@ def _create_test_order() -> tuple[Optional[str], str]:
     return (pk, timestamp)
 
 
-def _attempt_change_status_paid(pk_order_id: str, label: str) -> tuple[int, dict[str, Any]]:
-    """POST Orders/ChangeStatus with status=1 (PAID per the documented
-    enum). Returns (http_status, body_used).
-    """
-    body = {"orderIds": [pk_order_id], "status": 1}
-    _, status, _ = _try_call("Orders/ChangeStatus", body=body, label=label)
-    return status, body
-
-
-def _attempt_unpark(pk_order_id: str) -> tuple[int, dict[str, Any]]:
-    """POST Orders/SetOrderParkedStatus with isParked=false. Body shape
-    inferred from Linnworks's consistent `{orderIds:[uuid], <flag>}`
-    pattern (matches ChangeStatus signature).
-    """
-    body = {"orderIds": [pk_order_id], "isParked": False}
-    _, status, _ = _try_call("Orders/SetOrderParkedStatus", body=body, label="unpark via SetOrderParkedStatus")
-    return status, body
-
-
-def _verify(pk_order_id: str, baseline: dict[str, Any], stage_label: str) -> Optional[dict[str, Any]]:
-    """Read order back, print diff vs baseline, return the new
-    snapshot. None if readback failed.
-    """
-    after_order = _read_order(pk_order_id)
-    if not after_order:
-        print(f"    [{stage_label}] readback failed — cannot verify")
-        return None
-    after = _payment_snapshot(after_order)
-    changes = _diff(baseline, after)
-    print(f"    [{stage_label}] fields that changed since baseline: {json.dumps(changes, default=str)}")
-    return after
-
-
 def main() -> int:
-    print("--- probe_linnworks_mark_paid (v2 — targeted, post-research) ---")
+    print("--- probe_linnworks_mark_paid (v3 — form-encoded ChangeStatus, unpark first) ---")
 
-    # Visibility only — DEFAULT_LOCATION_ID is hardcoded in the
-    # CreateOrders helper. Logging the live list keeps a tenant change
-    # obvious in the workflow log.
     _list_locations()
 
     pk_order_id: Optional[str] = None
     timestamp: str = ""
-    working_path: Optional[str] = None
-    working_body: Optional[dict[str, Any]] = None
-    working_recipe: Optional[str] = None  # human description of what worked
-    final_dispatched = False
+    recipe_works = False
 
     try:
         pk_order_id, timestamp = _create_test_order()
         if not pk_order_id:
             print(
                 "=== DISCOVERY: could not create a test order via Orders/CreateOrders. "
-                "Run probe 3 (probe-linnworks-create-orders) first to lock in the "
-                "working wire format, then re-run this probe. ==="
+                "Run probe 3 first to lock in the working wire format, then re-run. ==="
             )
             return 2
 
@@ -258,86 +234,69 @@ def main() -> int:
         print(f"\n=== DISCOVERY: baseline payment + parked fields on new order ===")
         print(json.dumps(baseline, indent=2, default=str))
 
-        # ---------- A — ChangeStatus directly on the parked order ----------
-        print("\n--- attempt A: Orders/ChangeStatus(status=1) on parked order ---")
-        a_status, a_body = _attempt_change_status_paid(
-            pk_order_id, label="A: ChangeStatus(status=1) on parked order"
-        )
-        if a_status == 200:
-            after_a = _verify(pk_order_id, baseline, "after A")
-            if after_a is not None:
-                if _looks_dispatched(after_a):
-                    print(
-                        "=== DISCOVERY: WARNING — A appears to have dispatched the order. "
-                        "Wrong path. ==="
-                    )
-                    final_dispatched = True
-                elif _looks_paid(after_a):
-                    working_path = "Orders/ChangeStatus"
-                    working_body = a_body
-                    working_recipe = "Single call: Orders/ChangeStatus with status=1 on a parked order (Linnworks accepts payment transitions on parked orders directly)."
-                    print(
-                        f"\n=== DISCOVERY: mark-paid endpoint that worked: Orders/ChangeStatus ===\n"
-                        f"=== DISCOVERY: working body = {json.dumps(a_body)} ===\n"
-                        f"=== DISCOVERY: post-call payment snapshot = {json.dumps(after_a, default=str)} ===\n"
-                        f"=== DISCOVERY: order is paid AND not dispatched — correct path. ===\n"
-                    )
-
-        # ---------- B + C — only if A didn't already succeed ----------
-        if not working_path and not final_dispatched:
-            print("\n--- attempt B: Orders/SetOrderParkedStatus(isParked=false) ---")
-            b_status, b_body = _attempt_unpark(pk_order_id)
-            if b_status == 200:
-                after_b = _verify(pk_order_id, baseline, "after B")
-                if after_b is not None and _looks_unparked(after_b):
-                    print("=== DISCOVERY: unpark via Orders/SetOrderParkedStatus succeeded ===")
-                    print(f"=== DISCOVERY: unpark body = {json.dumps(b_body)} ===")
-                else:
-                    print(
-                        "    [B] HTTP 200 but IsParked did not flip to false — "
-                        "body shape may be wrong. Continuing to C anyway."
-                    )
-
-                print("\n--- attempt C: Orders/ChangeStatus(status=1) retry after unpark ---")
-                c_status, c_body = _attempt_change_status_paid(
-                    pk_order_id, label="C: ChangeStatus(status=1) after unpark"
-                )
-                if c_status == 200:
-                    after_c = _verify(pk_order_id, baseline, "after C")
-                    if after_c is not None:
-                        if _looks_dispatched(after_c):
-                            print(
-                                "=== DISCOVERY: WARNING — C appears to have dispatched the order. ==="
-                            )
-                            final_dispatched = True
-                        elif _looks_paid(after_c):
-                            working_path = "Orders/ChangeStatus (after unpark)"
-                            working_body = c_body
-                            working_recipe = (
-                                "Two-step: (1) Orders/SetOrderParkedStatus with "
-                                f"{json.dumps(b_body)} to unpark, then (2) "
-                                f"Orders/ChangeStatus with {json.dumps(c_body)} to mark paid. "
-                                "Required because parked orders reject direct status transitions."
-                            )
-                            print(
-                                f"\n=== DISCOVERY: mark-paid two-step that worked ===\n"
-                                f"=== DISCOVERY: step 1 = Orders/SetOrderParkedStatus, body = {json.dumps(b_body)} ===\n"
-                                f"=== DISCOVERY: step 2 = Orders/ChangeStatus, body = {json.dumps(c_body)} ===\n"
-                                f"=== DISCOVERY: post-call payment snapshot = {json.dumps(after_c, default=str)} ===\n"
-                                f"=== DISCOVERY: order is paid AND not dispatched — correct path. ===\n"
-                            )
-            else:
-                print(
-                    f"    [B] HTTP {b_status} — Orders/SetOrderParkedStatus rejected this body shape. "
-                    "Skipping C since we can't unpark."
-                )
-
-        if not working_path:
+        # ---------- Step 1 — unpark ----------
+        print("\n--- step 1: unpark via Orders/SetOrderParkedStatus (form-encoded) ---")
+        unpark_status = _attempt_unpark(pk_order_id)
+        if unpark_status == 404:
             print(
-                "\n=== DISCOVERY: NO attempt produced a paid+not-dispatched order. "
-                "Read the diffs above for hints. Likely next step: try "
-                "{\"orderId\": pk, \"isParked\": false} (singular) for SetOrderParkedStatus, "
-                "or look up Orders/UnlockOrder. Update DISCOVERIES.md §4 before re-probing. ==="
+                "=== DISCOVERY: Orders/SetOrderParkedStatus returned HTTP 404. "
+                "The endpoint name is wrong on this tenant. "
+                "Capture the unpark request from the Linnworks dashboard UI "
+                "(click an order → unpark → check DevTools → Network) and "
+                "update this probe with the real path. Don't burn more guesses here. ==="
+            )
+            return 7
+        if unpark_status != 200:
+            print(
+                f"=== DISCOVERY: Orders/SetOrderParkedStatus returned HTTP {unpark_status}. "
+                "Form body shape may be wrong (orderIds JSON-string + isParked=false). "
+                "Capture the unpark request from the Linnworks UI to confirm the exact body. ==="
+            )
+            return 8
+
+        after_unpark = _verify(pk_order_id, baseline, "after step 1 (unpark)")
+        if after_unpark is None or after_unpark.get("IsParked") is not False:
+            print(
+                "=== DISCOVERY: SetOrderParkedStatus returned 200 but IsParked did not flip "
+                "to false. The form body shape is probably wrong even though the endpoint "
+                "exists. Capture the unpark request from the UI. ==="
+            )
+            return 9
+        print("=== DISCOVERY: step 1 OK — order is now unparked (IsParked: false) ===")
+
+        # ---------- Step 2 — mark paid ----------
+        print("\n--- step 2: mark paid via Orders/ChangeStatus (form-encoded, status=1) ---")
+        paid_status = _attempt_change_status_paid(pk_order_id)
+        if paid_status != 200:
+            print(
+                f"=== DISCOVERY: Orders/ChangeStatus returned HTTP {paid_status} after a "
+                "successful unpark. Unexpected — the UI capture says this call works. "
+                "Inspect the response body above. ==="
+            )
+            return 10
+
+        after_paid = _verify(pk_order_id, baseline, "after step 2 (mark paid)")
+        if after_paid is None:
+            return 11
+
+        status_now = after_paid.get("GeneralInfo.Status")
+        processed_now = after_paid.get("Processed", after_paid.get("GeneralInfo.Processed"))
+        if status_now == 1 and processed_now is not True:
+            recipe_works = True
+            print(
+                "\n=== DISCOVERY: mark-paid recipe CONFIRMED ===\n"
+                "=== DISCOVERY: endpoint = POST /api/Orders/ChangeStatus ===\n"
+                "=== DISCOVERY: encoding = application/x-www-form-urlencoded ===\n"
+                "=== DISCOVERY: body = orderIds=[\"<uuid>\"]&status=1 (orderIds is a JSON-string-of-array) ===\n"
+                "=== DISCOVERY: status enum = 0=Unpaid, 1=Paid (confirmed via UI capture) ===\n"
+                "=== DISCOVERY: parked orders are silently no-op'd — must SetOrderParkedStatus(isParked=false) FIRST ===\n"
+                f"=== DISCOVERY: post-call snapshot = {json.dumps(after_paid, default=str)} ===\n"
+            )
+        else:
+            print(
+                f"=== DISCOVERY: ChangeStatus returned 200 but verification failed. "
+                f"GeneralInfo.Status={status_now!r} (want 1), Processed={processed_now!r} "
+                "(want false). Read the diff above. ==="
             )
 
     finally:
@@ -359,12 +318,12 @@ def main() -> int:
                 return 4
             print(f"=== DISCOVERY: cleanup via {cleanup_path} succeeded ===")
 
-    if final_dispatched and not working_path:
-        return 5
-    if not working_path:
+    if not recipe_works:
         return 6
     print(
-        f"\n=== DISCOVERY: probe complete. Working mark-paid recipe: {working_recipe} ==="
+        "\n=== DISCOVERY: probe complete. Recipe: "
+        "(1) Orders/SetOrderParkedStatus form-encoded {orderIds:'[\"<uuid>\"]', isParked:'false'} "
+        "(2) Orders/ChangeStatus form-encoded {orderIds:'[\"<uuid>\"]', status:'1'} ==="
     )
     return 0
 
