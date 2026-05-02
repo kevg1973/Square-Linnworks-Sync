@@ -150,7 +150,7 @@ deliverable that can be tested before the next is built on top.
 | Phase | What | Status |
 |---|---|---|
 | **0a** | Repo skeleton + auth smoke test | ✅ complete (2026-05-01) |
-| 0b | Diagnostic probes for the four unknowns | 3 of 4 complete (mark-paid deferred — endpoint discovery needed) |
+| **0b** | Diagnostic probes for the four unknowns | ✅ COMPLETE 2026-05-02 — all 4 probes green |
 | 1 | Reconciliation report (read-only, both APIs) | not started |
 | 2 | Stock-push cron (Linnworks → Square, write to Square) | not started |
 | 3 | Order-pull cron (Square → Linnworks, write to Linnworks) | not started |
@@ -266,11 +266,40 @@ for self-cleanup; production code shouldn't normally need it.
 ### `IsParked: true` on direct-source orders
 
 Orders created via `Orders/CreateOrders` with `Source = "DIRECT"`
-land **parked** (`IsParked: true` on the readback). Parked orders
-sit outside Linnworks' normal dispatch flow. Phase 3 design will
-likely need to unpark before the order is visible in Kevin's normal
-"open orders" view — endpoint TBD (research with mark-paid; see
-"Known unknowns").
+land **parked** (`GeneralInfo.IsParked: true` on the readback).
+Parked orders sit outside Linnworks' normal dispatch flow — they
+won't appear in Kevin's "open orders" view, and any
+`Orders/ChangeStatus` call against them is silently no-op'd
+(returns 200, doesn't change anything). The mark-paid recipe
+unparks first; see below.
+
+### Mark-as-paid recipe (two-step, both form-encoded)
+
+Phase 3 (order-pull) creates orders from Square POS sales that have
+already been paid at the till. The full recipe is two sequential
+calls, both `application/x-www-form-urlencoded`:
+
+1. **Unpark** — `POST /api/Orders/ChangeOrderTag`,
+   form body `orderIds=["<uuid>"]` (the value is a JSON-encoded
+   array as a string, then URL-encoded; same trick as
+   `Dashboards/ExecuteCustomPagedScript`'s `parameters` field).
+   No other fields. In Python:
+   `form = {"orderIds": json.dumps([pk])}`.
+
+2. **Mark paid** — `POST /api/Orders/ChangeStatus`,
+   form body `orderIds=["<uuid>"]&status=1`. Status enum:
+   `0` = Unpaid, `1` = Paid (confirmed by capturing the dashboard's
+   own request via DevTools). In Python:
+   `form = {"orderIds": json.dumps([pk]), "status": "1"}`.
+
+Order is paid, not dispatched, and Linnworks server-side stamps a
+`PaidDateTime` field automatically when `Status` flips to `1`. See
+`DISCOVERIES.md` §4 for the full evidence and the list of endpoints
+ruled out (don't re-test them).
+
+**Critical**: step 1 MUST run before step 2. Skipping the unpark
+makes step 2 silently no-op — no error, no warning, just a stuck
+parked order with `Status: 0`.
 
 ### Stock locations on this tenant
 
@@ -282,26 +311,6 @@ Three in total. The one used for Square→Linnworks orders:
 The other two are visible in any probe-3 workflow log under the
 `=== DISCOVERY: 3 stock location(s) on tenant ===` line; not on the
 critical path for Phases 1–3.
-
-## Known unknowns
-
-Things we still need to figure out before the next phase can land.
-Each entry names the pre-requisite work and where to look first.
-
-- **Mark-as-paid endpoint.** Phase 3 (order-pull) blocks on this.
-  The Phase 0b mark-paid probe attempted six request shapes across
-  four endpoint paths (`Orders/SetPaymentStatus`,
-  `Orders/AddOrderPayment`, `Orders/SetOrderPayment`,
-  `Orders/PayOrder`); **all four returned HTTP 404** on this tenant.
-  Don't re-test those next session.
-  **Action before next probe attempt**: research the actual mark-as-
-  paid endpoint at apidocs.linnworks.net. Likely candidates to look
-  for: an unpark endpoint (since direct-source orders are
-  `IsParked: true` and parked orders may not accept payment writes),
-  endpoints under `Payments/` or `OrderPayments/`, or a
-  `ProcessedOrders/` path even though our orders aren't processed.
-  Update `DISCOVERIES.md` §4 with new candidate names *before*
-  writing more probe attempts.
 
 ## Required env vars / GitHub Actions secrets
 

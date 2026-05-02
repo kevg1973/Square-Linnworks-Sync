@@ -18,11 +18,9 @@ When a probe is re-run later (e.g. after a Square scope change or a
 Linnworks API tweak), update the relevant section in place. Keep dated
 entries when behaviour changes meaningfully.
 
-**Phase 0b status**: 3 of 4 probes complete (Square scopes, Supabase
-write patterns, Linnworks CreateOrders). Mark-paid probe deferred —
-all six candidate endpoints returned 404 on this tenant; the actual
-endpoint needs to be researched from apidocs.linnworks.net before the
-next probe attempt.
+**Phase 0b status**: ✅ COMPLETE 2026-05-02 — all 4 probes green
+(Square scopes, Supabase write patterns, Linnworks CreateOrders,
+Linnworks mark-paid).
 
 ---
 
@@ -178,74 +176,112 @@ only touch the Default location, but it's worth recording.
 
 ## 4. Linnworks "mark as paid (no dispatch)" mechanism
 
-**Probe**: `probes/probe_linnworks_mark_paid.py`
+**Probe**: `probes/probe_linnworks_mark_paid.py` (v5)
 **Workflow**: `.github/workflows/probe-linnworks-mark-paid.yml`
-**Status**: ⚠️ **IN PROGRESS** — every candidate endpoint returned
-HTTP 404. The actual endpoint needs to be researched from
-apidocs.linnworks.net before the next probe attempt.
+**Status**: ✅ **CONFIRMED 2026-05-02** — locked-in two-step recipe.
 
-### Endpoints ruled out (returned 404 — do NOT re-test next session)
+The full mechanism is **two sequential calls**, both
+`application/x-www-form-urlencoded` (NOT JSON). v1–v4 each got part
+of this wrong; the working endpoints + body shapes were captured by
+opening Linnworks dashboard DevTools and watching the actual
+requests the UI fires.
 
-The probe attempted six request shapes across four unique endpoint
-paths. **All four paths returned HTTP 404 on this tenant** — the
-endpoints don't exist (or are on the wrong cluster, but the cluster
-URL is the one returned by `Auth/AuthorizeByApplication` so that's
-unlikely):
+### Step 1 — Unpark via `Orders/ChangeOrderTag`
 
-- `Orders/SetPaymentStatus`  (3 body shape variants — camel, Pascal, request-wrapped)
-- `Orders/AddOrderPayment`
-- `Orders/SetOrderPayment`
-- `Orders/PayOrder`
+```
+POST /api/Orders/ChangeOrderTag
+Content-Type: application/x-www-form-urlencoded
+Authorization: <session token>
 
-### Baseline payment fields on a fresh CreateOrders order
+orderIds=%5B%22<uuid>%22%5D
+```
 
-Captured via `Orders/GetOrdersById` immediately after creation:
+The form value for `orderIds` is a **JSON-encoded array as a
+string** — the literal characters `["<uuid>"]` (brackets and quotes
+are part of the value), then URL-encoded by the HTTP client. No
+other parameters; the endpoint name itself implies the unpark
+action.
+
+In Python:
+```python
+form = {"orderIds": json.dumps([pk_order_id])}
+```
+
+Response is a bare JSON array containing the `pkOrderID`.
+
+### Step 2 — Mark paid via `Orders/ChangeStatus`
+
+```
+POST /api/Orders/ChangeStatus
+Content-Type: application/x-www-form-urlencoded
+Authorization: <session token>
+
+orderIds=%5B%22<uuid>%22%5D&status=1
+```
+
+Same JSON-string-of-array form-field convention. Status enum:
+**`0` = Unpaid, `1` = Paid** (confirmed via UI DevTools capture).
+Response is the same bare array shape as step 1.
+
+In Python:
+```python
+form = {"orderIds": json.dumps([pk_order_id]), "status": "1"}
+```
+
+### CRITICAL — ordering matters
+
+`ChangeOrderTag` **MUST** run before `ChangeStatus`. Parked orders
+silently no-op `ChangeStatus`: the call returns HTTP 200, but
+`GeneralInfo.Status` stays at `0`. This is a no-error,
+no-error-message failure mode and was the v3 false-success that
+took several rounds to diagnose. **Production code must always
+unpark first.**
+
+### Verified post-call state
+
+After both steps:
 
 | Field | Value |
 |---|---|
-| `GeneralInfo.Status`              | `0` |
+| `GeneralInfo.Status`              | `1`   (Paid) |
+| `GeneralInfo.IsParked`            | `false` |
+| `Processed`                       | `false` |
+| `GeneralInfo.Processed`           | `false` |
+
+The order shows as **Paid** in Linnworks' Open Orders view, **not
+dispatched** — exactly what Phase 3 needs (Kevin processes
+dispatch manually).
+
+### Bonus observation — `PaidDateTime`
+
+Linnworks automatically adds a `PaidDateTime` field to the order
+when `Status` flips to `1`. We don't set it — the platform stamps
+it server-side. Useful for audit logging in Phase 3.
+
+### Baseline payment fields on a fresh CreateOrders order
+
+Captured via `Orders/GetOrdersById` immediately after creation,
+before either step runs:
+
+| Field | Value |
+|---|---|
+| `GeneralInfo.Status`              | `0` (Unpaid per the enum) |
+| `GeneralInfo.IsParked`            | `true` |
 | `TotalsInfo.PaymentMethodId`      | `"00000000-0000-0000-0000-000000000000"` |
-| `IsParked`                        | `true` |
+| `Processed`                       | `false` |
 
-`Status = 0` likely means "open / received" (Linnworks doesn't
-publish the enum but `1` typically means "processed" i.e. dispatched).
-`PaymentMethodId` zeroed out is the "no payment recorded" state.
+### Endpoints ruled out — DO NOT re-test
 
-### `IsParked: true` — Phase 3 design implication
+These returned HTTP 404 on this tenant during v1/v3 attempts. They
+either don't exist or aren't routed on the EU cluster. Future
+probes should not waste time on them:
 
-Orders created via `Orders/CreateOrders` with `Source = "DIRECT"`
-land in a **parked** state. Parked orders sit outside Linnworks'
-normal dispatch flow — they can't be processed or dispatched, and
-Kevin won't see them in his usual "open orders" view until they're
-unparked.
-
-This is probably *why* the obvious mark-paid endpoints don't apply:
-the order is parked, payment can't be recorded against it directly.
-The Phase 3 order-pull flow may need to:
-
-1. Create the order via `Orders/CreateOrders` (parked).
-2. Unpark the order (endpoint TBD — research with mark-paid).
-3. Mark as paid (endpoint TBD).
-4. Leave open (do NOT dispatch — Kevin processes manually).
-
-…but this is speculation until we find the right endpoints.
-
-### Action for next session
-
-Before any further probe attempts, search apidocs.linnworks.net for:
-
-- the canonical mark-as-paid endpoint name (likely something we
-  haven't tried yet — possibly under `Payments/`, `OrderPayments/`,
-  or a `ProcessedOrders/` path even though our orders aren't
-  processed)
-- the unpark endpoint (search "park" / "unpark")
-- whether mark-paid is a side-effect of unparking + setting a payment
-  method ID, rather than a dedicated endpoint
-
-Update this section with the candidates *before* writing more probe
-attempts. The current probe layout (create test order → try paths →
-verify via readback → cleanup in finally) is sound and re-runnable;
-just plug new endpoint candidates into `_candidate_mark_paid_calls()`.
+- `Orders/SetPaymentStatus` (3 body shape variants attempted)
+- `Orders/AddOrderPayment`
+- `Orders/SetOrderPayment`
+- `Orders/PayOrder`
+- `Orders/SetOrderParkedStatus` (the obvious-sounding unpark
+  endpoint — doesn't exist; the real one is `ChangeOrderTag`)
 
 ---
 
