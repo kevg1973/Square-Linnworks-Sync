@@ -1,4 +1,4 @@
-"""probes/probe_linnworks_mark_paid.py — Phase 0b probe (v3).
+"""probes/probe_linnworks_mark_paid.py — Phase 0b probe (v4).
 
 Order-pull (Phase 3) creates Linnworks orders from Square POS sales.
 Square already took the money at the till, so the new Linnworks order
@@ -17,7 +17,11 @@ documented mark-as-paid endpoint and tried it as JSON. The endpoint
 returned HTTP 200 but the order's `GeneralInfo.Status` did not flip,
 which looked like the call was being silently ignored.
 
-## What v3 does — confirmed by capturing UI traffic
+**v3** switched ChangeStatus to form-encoded (correct, matches UI
+capture) but used `Orders/SetOrderParkedStatus` for the unpark step
+— that endpoint doesn't exist on this tenant and 404'd.
+
+## What v4 does — both endpoints captured from UI traffic
 
 Kevin captured the actual HTTP request the Linnworks dashboard fires
 when a user clicks **Actions → Change status → Paid** in the UI:
@@ -37,15 +41,14 @@ when a user clicks **Actions → Change status → Paid** in the UI:
 
 Orders created via `Orders/CreateOrders` with `Source = "DIRECT"`
 land **parked** (`IsParked: true` per probe 3). On a parked order
-`ChangeStatus` is silently ignored. So v3 is structured as a
+`ChangeStatus` is silently ignored. So v4 is structured as a
 two-step recipe:
 
-1. **Unpark** via `Orders/SetOrderParkedStatus`, form-encoded
-   `orderIds=["<uuid>"]&isParked=false`. Verify by readback that
-   `IsParked` flipped to `false`. (Body shape inferred — same form
-   field convention as `ChangeStatus`. If this still 404s the
-   endpoint name is wrong and we'll need to capture it from the UI
-   too. Don't burn more guesses.)
+1. **Unpark** via `Orders/ChangeOrderTag`, form-encoded
+   `orderIds=["<uuid>"]` (no other fields — the endpoint name itself
+   implies the unpark action). Endpoint and body captured from
+   Linnworks dashboard DevTools 2026-05-02. Verify by readback that
+   `IsParked` flipped to `false`.
 2. **Mark paid** via `Orders/ChangeStatus`, form-encoded
    `orderIds=["<uuid>"]&status=1`. Verify by readback that
    `GeneralInfo.Status` flipped to `1` AND `Processed` stayed
@@ -151,15 +154,19 @@ def _form_orderids(pk_order_id: str) -> str:
 
 
 def _attempt_unpark(pk_order_id: str) -> int:
-    """POST Orders/SetOrderParkedStatus form-encoded. Returns HTTP status."""
+    """POST Orders/ChangeOrderTag form-encoded. Returns HTTP status.
+
+    Endpoint and body shape captured from Linnworks dashboard DevTools
+    on 2026-05-02. Body is just orderIds — the endpoint name itself
+    implies the unpark action; no other fields.
+    """
     form = {
         "orderIds": _form_orderids(pk_order_id),
-        "isParked": "false",
     }
     _, status, _ = _try_call(
-        "Orders/SetOrderParkedStatus",
+        "Orders/ChangeOrderTag",
         form_body=form,
-        label="unpark via Orders/SetOrderParkedStatus (form-encoded)",
+        label="unpark via Orders/ChangeOrderTag (form-encoded)",
     )
     return status
 
@@ -206,7 +213,7 @@ def _create_test_order() -> tuple[Optional[str], str]:
 
 
 def main() -> int:
-    print("--- probe_linnworks_mark_paid (v3 — form-encoded ChangeStatus, unpark first) ---")
+    print("--- probe_linnworks_mark_paid (v4 — unpark via ChangeOrderTag, mark paid via ChangeStatus) ---")
 
     _list_locations()
 
@@ -235,31 +242,27 @@ def main() -> int:
         print(json.dumps(baseline, indent=2, default=str))
 
         # ---------- Step 1 — unpark ----------
-        print("\n--- step 1: unpark via Orders/SetOrderParkedStatus (form-encoded) ---")
+        print("\n--- step 1: unpark via Orders/ChangeOrderTag (form-encoded) ---")
         unpark_status = _attempt_unpark(pk_order_id)
         if unpark_status == 404:
             print(
-                "=== DISCOVERY: Orders/SetOrderParkedStatus returned HTTP 404. "
-                "The endpoint name is wrong on this tenant. "
-                "Capture the unpark request from the Linnworks dashboard UI "
-                "(click an order → unpark → check DevTools → Network) and "
-                "update this probe with the real path. Don't burn more guesses here. ==="
+                "=== DISCOVERY: Orders/ChangeOrderTag returned HTTP 404. "
+                "Unexpected — this endpoint was captured directly from the Linnworks "
+                "dashboard. Re-capture from DevTools and confirm the path. ==="
             )
             return 7
         if unpark_status != 200:
             print(
-                f"=== DISCOVERY: Orders/SetOrderParkedStatus returned HTTP {unpark_status}. "
-                "Form body shape may be wrong (orderIds JSON-string + isParked=false). "
-                "Capture the unpark request from the Linnworks UI to confirm the exact body. ==="
+                f"=== DISCOVERY: Orders/ChangeOrderTag returned HTTP {unpark_status}. "
+                "Body shape may have drifted from the UI capture. Re-capture from DevTools. ==="
             )
             return 8
 
         after_unpark = _verify(pk_order_id, baseline, "after step 1 (unpark)")
         if after_unpark is None or after_unpark.get("IsParked") is not False:
             print(
-                "=== DISCOVERY: SetOrderParkedStatus returned 200 but IsParked did not flip "
-                "to false. The form body shape is probably wrong even though the endpoint "
-                "exists. Capture the unpark request from the UI. ==="
+                "=== DISCOVERY: ChangeOrderTag returned 200 but IsParked did not flip "
+                "to false. Re-capture the unpark request from the UI to confirm body. ==="
             )
             return 9
         print("=== DISCOVERY: step 1 OK — order is now unparked (IsParked: false) ===")
@@ -285,11 +288,10 @@ def main() -> int:
             recipe_works = True
             print(
                 "\n=== DISCOVERY: mark-paid recipe CONFIRMED ===\n"
-                "=== DISCOVERY: endpoint = POST /api/Orders/ChangeStatus ===\n"
-                "=== DISCOVERY: encoding = application/x-www-form-urlencoded ===\n"
-                "=== DISCOVERY: body = orderIds=[\"<uuid>\"]&status=1 (orderIds is a JSON-string-of-array) ===\n"
-                "=== DISCOVERY: status enum = 0=Unpaid, 1=Paid (confirmed via UI capture) ===\n"
-                "=== DISCOVERY: parked orders are silently no-op'd — must SetOrderParkedStatus(isParked=false) FIRST ===\n"
+                "=== DISCOVERY: step 1 (unpark)   = POST /api/Orders/ChangeOrderTag, form-encoded, body=orderIds=[\"<uuid>\"] ===\n"
+                "=== DISCOVERY: step 2 (mark paid) = POST /api/Orders/ChangeStatus,   form-encoded, body=orderIds=[\"<uuid>\"]&status=1 ===\n"
+                "=== DISCOVERY: status enum = 0=Unpaid, 1=Paid (confirmed via UI capture 2026-05-02) ===\n"
+                "=== DISCOVERY: parked orders silently no-op ChangeStatus — ChangeOrderTag MUST run first ===\n"
                 f"=== DISCOVERY: post-call snapshot = {json.dumps(after_paid, default=str)} ===\n"
             )
         else:
@@ -322,7 +324,7 @@ def main() -> int:
         return 6
     print(
         "\n=== DISCOVERY: probe complete. Recipe: "
-        "(1) Orders/SetOrderParkedStatus form-encoded {orderIds:'[\"<uuid>\"]', isParked:'false'} "
+        "(1) Orders/ChangeOrderTag form-encoded {orderIds:'[\"<uuid>\"]'} "
         "(2) Orders/ChangeStatus form-encoded {orderIds:'[\"<uuid>\"]', status:'1'} ==="
     )
     return 0
