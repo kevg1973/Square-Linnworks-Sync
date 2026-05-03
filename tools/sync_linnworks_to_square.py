@@ -56,6 +56,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import requests
+
 from lib import db, linnworks, square
 
 
@@ -120,13 +122,46 @@ def _fetch_lw_page(page_number: int) -> list[dict[str, Any]]:
 
 
 def _pull_linnworks_items() -> list[dict[str, Any]]:
-    """Returns list of {sku, name, price_pence, barcode, qty}."""
+    """Returns list of {sku, name, price_pence, barcode, qty}.
+
+    End-of-catalog detection. Linnworks paginates Stock/GetStockItemsFull
+    by index — pageNumber walks 1..N. Two end signals exist on this
+    tenant and we handle both:
+
+      1. Partial page (fewer than entriesPerPage items returned).
+         This is the primary signal — stop cleanly after processing it.
+      2. HTTP 400 on a page request that goes off the end. This is
+         the belt-and-suspenders — we shouldn't normally reach it
+         once #1 stops us, but if a catalog total happens to land
+         exactly on a page boundary we'd request one page too many.
+         Treated as expected ONLY if we've pulled ≥1 page AND the
+         previous page was already partial. A 400 anywhere else
+         (page 1, or after a full page) is a real error and re-raises.
+    """
     items: list[dict[str, Any]] = []
     skipped_no_sku = 0
+    prev_page_count: Optional[int] = None
 
     for page_number in range(1, LW_PAGE_SAFETY_CAP + 1):
         print(f"\n--- Linnworks page {page_number} ---")
-        page_items = _fetch_lw_page(page_number)
+        try:
+            page_items = _fetch_lw_page(page_number)
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if (
+                status == 400
+                and page_number > 1
+                and prev_page_count is not None
+                and prev_page_count < LW_ENTRIES_PER_PAGE
+            ):
+                print(
+                    f"    page {page_number} returned HTTP 400 — expected "
+                    f"end-of-catalog 400 (previous page was partial: "
+                    f"{prev_page_count} < {LW_ENTRIES_PER_PAGE}). Stopping cleanly."
+                )
+                break
+            raise
+
         if not page_items:
             print(f"    page {page_number} empty — Linnworks pull complete")
             break
@@ -154,6 +189,14 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
                 "barcode": barcode,
                 "qty": qty,
             })
+
+        prev_page_count = len(page_items)
+        if len(page_items) < LW_ENTRIES_PER_PAGE:
+            print(
+                f"    page {page_number} partial ({len(page_items)} < "
+                f"{LW_ENTRIES_PER_PAGE}) — last page, Linnworks pull complete"
+            )
+            break
     else:
         print(
             f"\n!!! Linnworks page safety cap ({LW_PAGE_SAFETY_CAP}) hit — "
