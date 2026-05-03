@@ -1,92 +1,294 @@
 # Linnworks ↔ Square Sync — Project State
 
-## What this app does
+## Current State (May 3, 2026)
 
-Two independent one-way syncs between Linnworks (source of truth) and
-Square (POS terminal at Northwest Guitars):
+**Project location**: `/Volumes/Music/Github/Square Linnworks Sync` (local),
+`kevg1973/Square-Linnworks-Sync` (private GitHub repo).
 
-1. **Linnworks → Square** (cron, every 15 min): push SKU, title,
-   price, and stock to Square so the POS reflects current inventory.
-2. **Square → Linnworks** (cron, every 5 min): pull POS sales and
-   create matching orders in Linnworks. Auto-marked as paid (POS = money
-   already taken). NOT auto-dispatched — Kevin manually processes.
+**Goal**: Replace the legacy Square sync with a clean rebuild.
+Linnworks is the source of truth (~100 orders/day across Shopify and
+eBay). Square is used for POS + Appointments only. **Cutover before
+the shop reopens Tuesday morning.**
 
-A separate **reconciliation** workflow runs on-demand (manually
-triggered) and produces a read-only CSV report comparing the two
-catalogues by SKU.
+**Stack**: Python 3.12, GitHub Actions cron, Supabase (project
+`cart-upsell-tracker`, all tables prefixed `sq_*`), £0/month.
 
-Replaces a legacy Square sync app that crashed occasionally and that
-Kevin had no way to fix or restart, since someone else built it.
+**Phase status**:
 
-## Project lives at
+| Phase | What | Status |
+|---|---|---|
+| **0a** | Repo skeleton + auth smoke test                        | ✅ complete (2026-05-01) |
+| **0b** | Diagnostic probes (Square scopes, Linnworks endpoints) | ✅ complete (2026-05-02) — 4/4 probes green, mark-paid recipe locked in |
+| **1**  | Wipe + rebuild Square's retail catalog from Linnworks  | ⏳ tools built and observe-verified, **write-mode runs pending** |
+| 2      | Stock-push cron (Linnworks → Square, every 15 min)     | not started |
+| 3      | Order-pull cron (Square → Linnworks, every 5 min)      | not started |
+| 4      | Operational dashboard                                   | not started |
 
-GitHub repo `linnworks-square-sync` (private). All code, all
-workflows, all migrations. No external SSD dependency, unlike the
-Easyship app.
+## What's been built and tested
 
-## Stack (all locked in)
+### Wipe tool — ✅ COMPLETE, observe-verified
 
-- **Language**: Python 3.12
-- **Compute**: GitHub Actions (cron via `schedule:` triggers + manual
-  via `workflow_dispatch`)
-- **State**: Supabase — tacked onto an existing project, all tables
-  prefixed `sq_`
-- **Cost**: £0/month (GitHub free tier, Supabase free, no other
-  services)
+`tools/wipe_square_items.py` + `.github/workflows/wipe-square-items.yml`.
 
-## Why these choices
+- Walks the entire Square catalog, classifies each item by
+  `item_data.product_type`.
+- Observe run reports: **would delete 7,381 REGULAR retail items, keep
+  9 APPOINTMENTS_SERVICE**. Anything with an unknown/missing
+  `product_type` is skipped and reported (never deleted).
+- `--write` flag required to actually delete; default is observe.
+  Workflow `mode` input dropdown also defaults to `observe`.
+- `--limit N` for staged write runs.
+- Audit log to `sq_wipe_log` (one row per run, observe or write).
 
-### Why GitHub Actions and not Railway / Cloudflare
+### Sync tool — ✅ OBSERVE WORKING, write-mode pending
 
-- GitHub Actions cron is genuinely free for this workload (~190
-  minutes/month total across both jobs, well under the 2,000-minute
-  free tier).
-- Every run is visible in the Actions tab as a clickable log. When
-  something fails, Kevin clicks it, sees the error, and re-runs with a
-  button. This directly addresses the "I have no control over the old
-  app when it breaks" pain point.
-- Cloudflare Workers cron has been observed to silently stop firing
-  for 24+ hours (community reports March 2026). For a stock sync that
-  affects what customers can buy at the till, that's an unacceptable
-  failure mode.
-- Railway Hobby would work fine but costs £4/month for nothing this
-  stack doesn't already have.
+`tools/sync_linnworks_to_square.py` +
+`.github/workflows/sync-linnworks-to-square.yml`.
 
-### Why Python and not Node
+- Pulls all Linnworks SKUs via `Stock/GetStockItemsFull` (paged 200
+  at a time; partial-page detection for end-of-catalog), walks
+  Square's REGULAR catalog, fetches current Square inventory,
+  classifies each Linnworks item as **CREATE / UPDATE / STOCK_ONLY /
+  NO_OP**.
+- CREATE/UPDATE go through `catalog/batch-upsert` (chunks of 100 with
+  per-batch `idempotency_key`); UPDATEs include item-level + variation-
+  level `version` for optimistic concurrency. Stock pushes go through
+  `inventory/changes/batch-create` as `PHYSICAL_COUNT` against
+  `L74KSP08AJ2GH`.
+- `--write` flag, `--limit N`, audit log to `sq_lw_sync_log`.
 
-- Linnworks reference doc (sister project) is already written in
-  Python idioms. All pattern-matching to that doc is free.
-- Square SDK for Python is well-maintained.
-- GitHub Actions runs Python natively without setup.
-- The Easyship app stays in Node — separate project, no shared code.
+**Latest observe-run breakdown (pre-wipe)**:
 
-### Why Supabase tack-on rather than a new project
+| Metric | Value |
+|---|---|
+| Linnworks items pulled                | 4,193 |
+| Square REGULAR SKUs walked            | 6,354 |
+| Duplicate Square SKUs ignored         | 1,027 |
+| Would CREATE                          | 105 |
+| Would UPDATE (mostly price fixes)     | 400 |
+| Would STOCK_ONLY                      | 2,338 |
+| Would NO_OP                           | 1,350 |
 
-- Kevin has used all his free Supabase project slots.
-- Paying for Supabase Pro to isolate this sync from another project
-  isn't justified ($25/mo for soft isolation).
-- All this sync's tables prefixed `sq_*` to avoid collisions with the
-  host project's schema.
+⚠️ **Known bug**: the final `=== SYNC COMPLETE: ===` summary line
+showed `created=0 updated=0 stock_only=0` despite the per-action plan
+having 105 / 400 / 2,338. The plan numbers are correct; the summary
+tally is broken (likely a counter-reset bug). Verify and fix before
+the write-mode run — see *Open issues* below.
 
-### Why two crons instead of one daemon
+## Discoveries to remember
 
-- Independent failure domains. If `stock-push` breaks, orders still
-  flow. If `order-pull` breaks, stock still updates.
-- No always-on service to babysit, no "is the server up" failure mode.
+These are the load-bearing facts learned from running probes and
+observe-mode tools. `DISCOVERIES.md` has the full evidence; this is
+the production-relevant summary.
 
-### Why a few minutes of staleness is acceptable
+### Catalog discrimination
 
-- Northwest Guitars does ~100 orders/day across Shopify/eBay. Stock
-  level lag of 5–20 minutes is within tolerance for a guitar shop —
-  POS staff can see what's physically on the shelf, and the count
-  reconciles within 20 minutes worst-case.
-- The double-sell race (last unit sold on Shopify in the same window
-  as a POS sale at the till) is rare and would be handled the same way
-  as today (apologise to one customer, refund). System can't prevent
-  it without real-time webhooks, and webhooks aren't worth the
-  complexity for a once-a-month edge case.
+- **Square catalog discrimination = `item_data.product_type`.**
+  `REGULAR` is retail; `APPOINTMENTS_SERVICE` is the 9 services in
+  Square's Service library. This is structural, not heuristic — don't
+  try to infer service-ness from `available_for_booking` or
+  `service_duration`, both are unreliable.
+- **Linnworks `IsNotTrackable` comes back as `None`** on this
+  tenant — unreliable for filtering services.
+- **Square has 1,023 duplicate SKUs.** Some are exact duplicate
+  items, some have *different names on the same SKU* (real data-
+  integrity bugs from the legacy sync). The wipe nukes them all; the
+  sync's duplicate handler arbitrarily picks the first match and
+  warns.
+- **Square data is non-precious.** All Square data is downstream from
+  Linnworks. No sales-history attribution, no per-user assignments.
+  Wipe-and-rebuild is safe.
+- **Service SKUs in Linnworks (`GTR-001` through `GTR-010`) have fake
+  stock counts** (e.g. 4,829). Per Kevin's decision: don't filter,
+  push everything; services land in Square's Item library as harmless
+  clutter. They won't affect Square Appointments, which is a separate
+  library.
 
-## Architecture
+### Square API conventions
+
+- **Pricing**: Linnworks `RetailPrice` (decimal pounds) × 100 = Square
+  `price_money.amount` (pence).
+- **Stock model**: absolute values via `inventory/changes/batch-create`
+  with `type: PHYSICAL_COUNT`. Not adjustments — push the desired
+  level directly.
+- **Catalog upsert is keyed on Square's catalog object id, not SKU.**
+  The mapping has to be remembered (we re-derive it from the catalog
+  walk on each sync run for now; will be cached in `sq_sku_map` once
+  the cron lands).
+- **Square location ID**: `L74KSP08AJ2GH` (Northwest Guitars). Pinned
+  in code — will be promoted to a `SQUARE_LOCATION_ID` env var when
+  Phase 2 cron lands.
+- **Catalog and Inventory are separate APIs.** Two write calls per
+  item per push (one upsert, one stock change).
+- **Rate limit**: 10 req/sec. Generous, but use batch endpoints.
+  Sync sleeps 0.2s between batches (~5 req/sec — well under).
+
+### Linnworks API conventions
+
+- **Cluster URL** returned by `Auth/AuthorizeByApplication`. This
+  tenant is `https://eu-ext.linnworks.net`. **Never hardcode** — use
+  the URL the auth response gives you.
+- **Auth header is the raw session token, no `Bearer` prefix.**
+- **401 on any call → re-auth once, retry once.** After that, fail
+  loud. `lib/linnworks.py` handles this.
+- **Rate limit ~1 req/sec.** Sleep ~1.1s between calls during heavy
+  reads.
+- **Default stock location** = `00000000-0000-0000-0000-000000000000`
+  (zero UUID).
+- **`Stock/GetStockItemsFull` pagination** terminates by *partial
+  page* (page returns < `entriesPerPage` items) **or** by HTTP 400
+  when you walk off the end. Sync handles partial-page detection
+  cleanly; if a 400 fires after a known partial page, it's treated as
+  end-of-catalog. Anywhere else, a 400 propagates as a real error.
+
+### `Orders/CreateOrders` (Phase 3 prep, locked in by probe)
+
+- `POST /api/Orders/CreateOrders` — JSON body `{"orders": [<order>]}`.
+  Plural; even for a single order. Response is a bare JSON array of
+  `pkOrderID` strings (not wrapped in `{Orders: [...]}`).
+- Required fields: `Source`, `SubSource`, `ReferenceNumber`,
+  `ExternalReferenceNumber`, `ReceivedDate`, `DispatchBy`,
+  `LocationId`, `Currency`, `OrderItems`, `DeliveryAddress`,
+  `BillingAddress`. The address must be named `DeliveryAddress`,
+  NOT `ShippingAddress`.
+- **Dedup key** is `(Source, SubSource, ReferenceNumber)`. Phase 3's
+  order-pull should derive `ReferenceNumber` deterministically from
+  Square's order id so retries are naturally idempotent.
+- Direct-source orders land **parked** (`IsParked: true`).
+
+### Mark-as-paid recipe (locked in 2026-05-02 by UI capture)
+
+Two-step, both `application/x-www-form-urlencoded`:
+
+1. **Unpark** — `POST /api/Orders/ChangeOrderTag`,
+   form body `orderIds=["<uuid>"]` (the value is a JSON-encoded array
+   as a string, then URL-encoded; same trick as
+   `Dashboards/ExecuteCustomPagedScript`'s `parameters`). No other
+   fields. In Python: `form = {"orderIds": json.dumps([pk])}`.
+2. **Mark paid** — `POST /api/Orders/ChangeStatus`,
+   form body `orderIds=["<uuid>"]&status=1`. Status enum: `0` = Unpaid,
+   `1` = Paid.
+
+**Critical**: step 1 MUST run before step 2. Skipping the unpark
+makes step 2 silently no-op (returns 200, doesn't change `Status`).
+Linnworks server-side stamps `PaidDateTime` automatically when
+`Status` flips to `1`.
+
+## Required GitHub Actions secrets (all 7 set)
+
+```
+LINNWORKS_APP_ID
+LINNWORKS_APP_SECRET
+LINNWORKS_TOKEN
+SQUARE_ACCESS_TOKEN
+SQUARE_APPLICATION_ID
+SUPABASE_URL              (https://miicdzowfzxffnorlqzp.supabase.co)
+SUPABASE_SERVICE_KEY
+```
+
+All seven go into GitHub repo Settings → Secrets and variables →
+Actions as repository secrets. None are committed to the repo.
+
+## Repo structure
+
+```
+Square-Linnworks-Sync/
+├── .github/workflows/
+│   ├── smoke-test.yml
+│   ├── probe-square-scopes.yml
+│   ├── probe-square-catalog.yml
+│   ├── probe-square-duplicates.yml
+│   ├── probe-linnworks-create-orders.yml
+│   ├── probe-linnworks-mark-paid.yml
+│   ├── probe-supabase-write-pattern.yml
+│   ├── wipe-square-items.yml              ✅
+│   └── sync-linnworks-to-square.yml       ✅ (observe verified)
+├── lib/                  config.py, linnworks.py, square.py, db.py
+├── probes/               probe_*.py (Phase 0b artefacts)
+├── tools/
+│   ├── __init__.py
+│   ├── wipe_square_items.py               ✅
+│   └── sync_linnworks_to_square.py        ✅ (observe verified)
+├── supabase/001_initial.sql               sq_* tables incl. sq_wipe_log + sq_lw_sync_log
+├── CLAUDE.md
+├── LINNWORKS_REFERENCE.md
+├── DISCOVERIES.md
+└── requirements.txt
+```
+
+## Cutover plan (target: Monday before EOD)
+
+1. Re-run **Sync — Linnworks → Square** in observe mode. Verify the
+   breakdown still looks right (≈4,193 Linnworks items, ≈7,381
+   would-delete in Square, mostly CREATE after wipe).
+2. Maintenance window opens (shop closed).
+3. Run **Wipe — Square retail items** with `mode=write`. Deletes
+   7,381 retail, keeps 9 services.
+4. Verify Square dashboard shows only services in the Item library.
+5. Run **Sync — Linnworks → Square** with `mode=write`. Creates
+   ≈4,193 retail items, sets stock from Linnworks.
+6. Verify Square dashboard populated correctly.
+7. Kill the legacy sync app.
+8. Monitor for an hour.
+9. Tuesday morning: shop reopens, till works.
+
+## Open issues / next session
+
+- **Sync's final summary line is broken.** Showed
+  `created=0 updated=0 stock_only=0` in the latest observe run despite
+  the plan having 105 / 400 / 2,338. The per-category plan numbers
+  are correct; only the summary tally is wrong. Verify and fix
+  before the write-mode run.
+- **`sq_lw_sync_log` schema cache.** The migration created the table
+  but PostgREST's schema cache wasn't refreshed in time for the
+  latest run, so the audit insert failed with
+  `PGRST205 — Could not find the table 'public.sq_lw_sync_log' in the
+  schema cache`. Always run `NOTIFY pgrst, 'reload schema';` in the
+  Supabase SQL editor after applying a migration.
+- **Image sync deferred.** Basic SKU/name/price/stock first; product
+  pictures are a follow-up after cutover.
+- **Per-supplier code cache, sales velocity ingest from Script 47**,
+  etc. — out of scope for cutover.
+
+## Operational gotchas
+
+- **Repo lives on external SSD** `/Volumes/Music/`. Must be mounted
+  to commit (not to run workflows — those run on GitHub-hosted
+  runners regardless of local mount state).
+- **macOS leaks `._*` AppleDouble files** when copying onto FAT/exFAT
+  volumes. `.gitignore` should swallow them; if any sneak in, delete
+  with `find . -name '._*' -delete`.
+- **Supabase free Nano projects pause after 7 days inactivity.** If a
+  workflow run starts failing with connection errors, check the
+  Supabase dashboard and unpause if needed.
+- **Linnworks**: rate limit ~1 req/sec, auth header is the raw token
+  (no `Bearer` prefix), 401 → re-auth + retry once.
+- **After modifying `supabase/001_initial.sql`**: paste into the
+  Supabase SQL editor and run it (idempotent — every CREATE uses
+  `IF NOT EXISTS`), **then** run `NOTIFY pgrst, 'reload schema';` so
+  PostgREST sees new tables. Without the NOTIFY, audit inserts will
+  fail with `PGRST205` for ~minutes until the cache naturally
+  refreshes.
+- **`LINNWORKS_REFERENCE.md`** in the repo has the full Linnworks API
+  working reference (auth, gotchas, the `Dashboards/ExecuteCustomPagedScript`
+  form-encoding trick, etc.). Read it before writing new Linnworks
+  endpoint code.
+
+## Working method (Kevin's preference)
+
+- Kevin uses Claude Code in the terminal for code generation.
+- Chat-Claude is architect/reviewer.
+- Chat writes prompts; Claude Code commits + pushes; Kevin runs
+  workflows from the GitHub Actions tab and pastes logs back.
+- Migration changes need manual paste into the Supabase SQL editor +
+  `NOTIFY pgrst, 'reload schema';` after.
+- GitHub Desktop for version control (not CLI git) when Kevin works
+  the repo himself.
+- Numbered update logs and step-by-step instructions preferred.
+- Reliable solutions over fancy ones — was burned by macOS permission
+  battles during a previous build.
+
+## Architecture (the eventual shape, post-cutover)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -113,7 +315,12 @@ Easyship app.
        └───────────────┘         └──────────────┘         └────────────┘
 ```
 
-## Stock decrement flow (the loop)
+The Phase 1 wipe + sync tools are the manual one-shot equivalent of
+what the Phase 2 cron will eventually do automatically. Once the
+catalog is rebuilt cleanly, Phase 2 takes over for the recurring
+delta sync.
+
+## Stock decrement flow (the eventual loop, post-Phase-3)
 
 ```
 Square sale fires (POS at till)
@@ -122,8 +329,11 @@ Square sale fires (POS at till)
 order-pull cron picks it up (within 5 min)
     │
     ▼
-Create Linnworks order (Source = "DIRECT", auto-marked as paid)
-    │ (Linnworks auto-decrements stock when the order lands)
+Create Linnworks order (Source = "DIRECT")
+    │
+    ▼
+Two-step mark-paid (ChangeOrderTag → ChangeStatus status=1)
+    │ (Linnworks auto-decrements stock when the order lands and is paid)
     ▼
 Order sits "open" in Linnworks for Kevin to process manually
     │
@@ -138,255 +348,50 @@ Reads current Linnworks stock for all SKUs
 Pushes deltas to Square via Catalog + Inventory APIs
 ```
 
-Linnworks is the only system that decrements stock on its own. Square
-gets corrected to whatever Linnworks says. No two-way decrement, no
-race conditions on the truth.
+Linnworks is the only system that decrements stock on its own.
+Square gets corrected to whatever Linnworks says. No two-way
+decrement, no race conditions on the truth.
 
-## Phasing
+## Why these choices (preserved historical context)
 
-The build is intentionally phased so each step produces a runnable
-deliverable that can be tested before the next is built on top.
+### Why GitHub Actions and not Railway / Cloudflare
 
-| Phase | What | Status |
-|---|---|---|
-| **0a** | Repo skeleton + auth smoke test | ✅ complete (2026-05-01) |
-| **0b** | Diagnostic probes for the four unknowns | ✅ COMPLETE 2026-05-02 — all 4 probes green |
-| 1 | Reconciliation report (read-only, both APIs) | not started |
-| 2 | Stock-push cron (Linnworks → Square, write to Square) | not started |
-| 3 | Order-pull cron (Square → Linnworks, write to Linnworks) | not started |
-| 4 | Operational dashboard | not started |
-| 5 | Orphan-deletion path on reconciliation (with confirm step) | not started |
+GitHub Actions cron is genuinely free for this workload. Every run
+is a clickable log in the Actions tab — directly addresses the "I
+have no control over the old app when it breaks" pain point.
+Cloudflare Workers cron has been observed to silently stop firing
+for 24+ hours; Railway Hobby would work but costs £4/month for
+nothing this stack doesn't already have.
 
-## Phase 0a — what's here now
+### Why Python and not Node
 
-- Repo skeleton with the directory layout we've agreed
-- Supabase migration (`supabase/001_initial.sql`) with five `sq_*`
-  tables: `sq_sku_map`, `sq_sync_runs`, `sq_square_orders_processed`,
-  `sq_errors`, `sq_watermarks`
-- `lib/config.py` — env var loading with loud failures
-- `lib/linnworks.py` — auth + cluster discovery (reused pattern from
-  Easyship app's Linnworks integration)
-- `lib/square.py` — auth check + request helper
-- `lib/db.py` — Supabase client and audit-log helpers
-- `.github/workflows/smoke-test.yml` — manual-trigger workflow that:
-  1. Authenticates against Linnworks
-  2. Authenticates against Square (calls `/v2/locations` as the
-     auth check)
-  3. Round-trips Supabase (writes a row to `sq_sync_runs` with
-     status=success, then reads it back)
-  4. Prints success and exits
+`LINNWORKS_REFERENCE.md` (sister project) is already written in
+Python idioms. Square SDK for Python is well-maintained. GitHub
+Actions runs Python natively without setup. (The Easyship app is a
+separate project that stays in Node — no shared code.)
 
-If the smoke test passes, all credentials are wired correctly and we
-can start Phase 0b.
+### Why Supabase tack-on rather than a new project
 
-## Phase 0a — completed (2026-05-01)
+Kevin has used all his free Supabase project slots. Paying for
+Supabase Pro to isolate this sync from another project isn't
+justified ($25/mo for soft isolation). All this sync's tables are
+prefixed `sq_*` to avoid collisions with the host project.
 
-The smoke test workflow ran green on 2026-05-01:
+### Why two crons instead of one daemon
 
-- **Linnworks auth** — install token exchanged, session token + cluster
-  URL returned. Tenant cluster confirmed as the EU cluster.
-- **Square auth** — `/v2/locations` returned a non-zero list. The
-  physical-shop location for inventory writes is **`L74KSP08AJ2GH`**
-  (Northwest Guitars). This is the location ID we'll pin for all
-  inventory operations from Phase 2 onward. (Will be promoted to a
-  `SQUARE_LOCATION_ID` env var when stock-push lands; for now the
-  probes derive it at runtime from `/v2/locations`.)
-- **Supabase round-trip** — wrote a `smoke-test` row into
-  `sq_sync_runs`, marked it finished, read it back. Service-role key
-  has full access to the `sq_*` tables.
+Independent failure domains. If `stock-push` breaks, orders still
+flow. If `order-pull` breaks, stock still updates. No always-on
+service to babysit.
 
-All seven repository secrets are wired correctly. Cleared to start
-Phase 0b.
+### Why a few minutes of staleness is acceptable
 
-## Phase 0b — known unknowns to probe
-
-These are deliberately deferred from Phase 0a because we can't resolve
-them without running code against real APIs:
-
-1. **Square scopes on Kevin's existing app.** Need `ITEMS_READ`,
-   `ITEMS_WRITE`, `INVENTORY_READ`, `INVENTORY_WRITE`, `ORDERS_READ`.
-   Probe by calling each endpoint and observing whether we get
-   `INSUFFICIENT_SCOPES` errors. If anything's missing, add the scope
-   and re-issue the access token.
-
-2. **Square Location ID for the physical shop.** Inventory counts in
-   Square are per-location. Probe `/v2/locations` and pick the one
-   matching "Northwest Guitars" (or whatever it's called). Pin it as
-   `SQUARE_LOCATION_ID` in env vars from then on.
-
-3. **Linnworks `Orders/CreateNewOrder` body shape.** Per the
-   diagnostic-first pattern in §10 of `LINNWORKS_REFERENCE.md`, this
-   is tenant-dependent and the docs are stale. Probe with multiple
-   body shapes (flat / request-wrapped / SearchParameters-wrapped)
-   until one returns 200. Lock that shape in.
-
-4. **How to mark a Linnworks order as paid without dispatching.**
-   Possibly a field on `CreateNewOrder` itself; possibly a separate
-   `Orders/SetOrderPaymentStatus` (or similar) call. Probe.
-
-Each probe is a standalone Python script in `probes/`, runnable via
-its own `workflow_dispatch` workflow. Output goes to `DISCOVERIES.md`
-which is committed back to the repo as a permanent record of what
-shape works on Kevin's tenant.
-
-## Linnworks tenant facts (discovered)
-
-Locked-in by Phase 0b probes against the live Northwest Guitars
-tenant. `DISCOVERIES.md` has the full evidence; this is the
-production-code-relevant summary.
-
-### `Orders/CreateOrders` — the create-an-order endpoint
-
-- **Path**: `POST /api/Orders/CreateOrders` (plural — `CreateNewOrder`,
-  singular, creates empty drafts and is the wrong endpoint).
-- **Wire format**: JSON body `{"orders": [<order>]}`. Array under the
-  `orders` key, even for a single order.
-- **Response**: a bare JSON array of pkOrderID strings, e.g.
-  `["98c01c1a-cdfd-46f2-9bce-4c19d268bbe0"]` — **not** wrapped in
-  `{Orders: [...]}` or `{Data: [...]}`.
-- **Required fields on the order**: `Source`, `SubSource`,
-  `ReferenceNumber`, `ExternalReferenceNumber`, `ReceivedDate`,
-  `DispatchBy`, `LocationId`, `Currency`, `OrderItems` (array of
-  `{SKU, ChannelSKU, ItemTitle, ItemNumber, Qty, PricePerUnit,
-  Discount, LineDiscount, TaxRate}`), `DeliveryAddress`,
-  `BillingAddress`. The address must be named `DeliveryAddress` —
-  NOT `ShippingAddress`. (That single rename was the silent 400 cause
-  on v1.)
-- **Dedup key**: `(Source, SubSource, ReferenceNumber)`. Re-submitting
-  the same triple returns the same `pkOrderID`. The Phase 3 order-pull
-  cron should derive `ReferenceNumber` deterministically from Square's
-  order id so retries are naturally idempotent.
-
-### `Orders/DeleteOrder` — the cleanup endpoint
-
-`POST /api/Orders/DeleteOrder` (singular) with body
-`{"orderId": "<pkOrderID uuid>"}`. Returns 200. Used by the probes
-for self-cleanup; production code shouldn't normally need it.
-
-### `IsParked: true` on direct-source orders
-
-Orders created via `Orders/CreateOrders` with `Source = "DIRECT"`
-land **parked** (`GeneralInfo.IsParked: true` on the readback).
-Parked orders sit outside Linnworks' normal dispatch flow — they
-won't appear in Kevin's "open orders" view, and any
-`Orders/ChangeStatus` call against them is silently no-op'd
-(returns 200, doesn't change anything). The mark-paid recipe
-unparks first; see below.
-
-### Mark-as-paid recipe (two-step, both form-encoded)
-
-Phase 3 (order-pull) creates orders from Square POS sales that have
-already been paid at the till. The full recipe is two sequential
-calls, both `application/x-www-form-urlencoded`:
-
-1. **Unpark** — `POST /api/Orders/ChangeOrderTag`,
-   form body `orderIds=["<uuid>"]` (the value is a JSON-encoded
-   array as a string, then URL-encoded; same trick as
-   `Dashboards/ExecuteCustomPagedScript`'s `parameters` field).
-   No other fields. In Python:
-   `form = {"orderIds": json.dumps([pk])}`.
-
-2. **Mark paid** — `POST /api/Orders/ChangeStatus`,
-   form body `orderIds=["<uuid>"]&status=1`. Status enum:
-   `0` = Unpaid, `1` = Paid (confirmed by capturing the dashboard's
-   own request via DevTools). In Python:
-   `form = {"orderIds": json.dumps([pk]), "status": "1"}`.
-
-Order is paid, not dispatched, and Linnworks server-side stamps a
-`PaidDateTime` field automatically when `Status` flips to `1`. See
-`DISCOVERIES.md` §4 for the full evidence and the list of endpoints
-ruled out (don't re-test them).
-
-**Critical**: step 1 MUST run before step 2. Skipping the unpark
-makes step 2 silently no-op — no error, no warning, just a stuck
-parked order with `Status: 0`.
-
-### Stock locations on this tenant
-
-Three in total. The one used for Square→Linnworks orders:
-
-- **Default** — `StockLocationId = 00000000-0000-0000-0000-000000000000`,
-  `IsFulfillmentCenter = false`.
-
-The other two are visible in any probe-3 workflow log under the
-`=== DISCOVERY: 3 stock location(s) on tenant ===` line; not on the
-critical path for Phases 1–3.
-
-## Required env vars / GitHub Actions secrets
-
-```
-LINNWORKS_APP_ID         # From Linnworks Developer Dashboard
-LINNWORKS_APP_SECRET     # From Linnworks Developer Dashboard
-LINNWORKS_TOKEN          # Install token for Northwest Guitars tenant
-                         #   (these three are the same as the Easyship app —
-                         #    can be reused verbatim from .env there)
-
-SQUARE_ACCESS_TOKEN      # Production token, starts with EAAA...
-                         #   From developer.squareup.com → app → Credentials
-                         #   → toggle "Production" → Show Access Token
-SQUARE_APPLICATION_ID    # Production Application ID (same page)
-
-SUPABASE_URL             # https://<project-id>.supabase.co
-SUPABASE_SERVICE_KEY     # service_role key (NOT anon key) — has full DB access
-                         #   Settings → API → service_role secret
-```
-
-All seven go into GitHub repo Settings → Secrets and variables →
-Actions as repository secrets. None are committed to the repo.
-
-## Square credential gotcha
-
-Square has two kinds of access token:
-
-- **Personal access token** — full account access, no scopes,
-  never expires. What you want for a server-side integration like
-  this. Marker: starts with `EAAA...`.
-- **OAuth access token** — scoped, expires every 30 days, requires a
-  refresh-token flow. Used when an app accesses *other people's*
-  Square accounts. Marker: also starts with `EAAA...` but the
-  developer dashboard distinguishes them.
-
-The old sync app most likely used a personal access token (simpler,
-no refresh flow needed). If the smoke test fails with
-"AUTHENTICATION_ERROR / token expired", we're dealing with OAuth and
-need to add a refresh handler.
-
-## Linnworks gotchas (carried over from sister project)
-
-See `LINNWORKS_REFERENCE.md` for the full list. The ones most relevant
-to this project:
-
-- Auth response includes a `Server` URL — use that, don't hardcode the
-  cluster.
-- Authorization header is the raw session token, no `Bearer` prefix.
-- 401 on any call → re-auth once, retry once. After that, fail loud.
-- Rate limit ~1 req/sec on most endpoints. Sleep ~1.1s between calls
-  during heavy reads (stock-push pulling N items will need this).
-- For matching Square orders to Linnworks orders by reference number:
-  Linnworks orders created from Square will have `Source = "DIRECT"`
-  (we set it on creation). This is different from the Easyship app
-  which filters to `Source = "SHOPIFY"` — see the note in that
-  project's CLAUDE.md.
-- The shape of `Orders/CreateNewOrder` is one of the Phase 0b
-  unknowns. Don't assume it works until probed.
-
-## Square API notes
-
-- **Catalog and Inventory are separate APIs.** Updating an item's
-  price/title is `Catalog`. Updating its stock level is `Inventory`.
-  Two calls per item per push.
-- **Catalog upsert is keyed on Square's catalog object ID, not SKU.**
-  We must remember the ID Square assigned the first time we created
-  each item. That mapping lives in `sq_sku_map`.
-- **`BatchUpsertCatalogObjects` lets us send up to ~1000 items in one
-  call.** Use that for stock-push, not per-item calls.
-- **Inventory counts are per-location.** Phase 0b will pin the right
-  location ID.
-- **Rate limit: 10 req/sec.** Generous, but batch endpoints are still
-  the right way to use them.
-- **Square Webhooks API requires the personal access token, not OAuth.**
-  Not relevant for v1 (no webhooks) but worth knowing if we ever add
-  real-time triggers.
+Northwest Guitars does ~100 orders/day across Shopify/eBay. A 5–20
+minute stock-level lag is within tolerance — POS staff can see what's
+physically on the shelf, and the count reconciles within 20 minutes
+worst-case. The double-sell race (last unit sold on Shopify in the
+same window as a POS sale at the till) is rare and would be handled
+the same way as today (apologise, refund). Webhooks aren't worth the
+complexity for a once-a-month edge case.
 
 ## State management (Supabase tables)
 
@@ -394,51 +399,37 @@ All prefixed `sq_` to avoid collision with the host project.
 
 | Table | Purpose |
 |---|---|
-| `sq_sku_map` | The spine. One row per SKU, links Linnworks `StockItemId` to Square `catalog_object_id` + `variation_id`. Also holds `last_known_stock` and `last_known_price` so we can skip no-op writes. |
-| `sq_sync_runs` | One row per cron execution. Records status, item counts, GitHub run URL for click-through to logs. |
-| `sq_square_orders_processed` | Audit log + idempotency for order-pull. Keyed on Square's `order_id`. Prevents double-creation of Linnworks orders. |
-| `sq_errors` | Per-error log with context JSON. `job_name`, `occurred_at`, `message`, `context`. |
-| `sq_watermarks` | Key-value store for `last_pulled_at`-style cursors. Currently has `square_orders_last_pulled_at`. |
+| `sq_sku_map` | Spine for the eventual cron. One row per SKU; links Linnworks `StockItemId` to Square `catalog_object_id` + `variation_id`; caches `last_known_stock` and `last_known_price` for no-op skipping. Not yet populated — Phase 2 cron will write to this. |
+| `sq_sync_runs` | One row per cron execution (job_name, started_at, finished_at, status, items_processed/changed/errors, github_run_url). Used by `lib/db.py` `sync_run_start`/`sync_run_finish`. **Not the same as `sq_lw_sync_log`** — different shape and lifecycle. |
+| `sq_square_orders_processed` | Audit + idempotency for order-pull. Keyed on Square's `order_id`. Phase 3. |
+| `sq_errors` | Per-error log for non-fatal failures during a sync run. |
+| `sq_watermarks` | Key-value cursors (e.g. `square_orders_last_pulled_at`). |
+| `sq_wipe_log` | Audit row per wipe-tool run (observe or write). UUID PK, mode, walked/deleted/failed/kept counts, error_summary. |
+| `sq_lw_sync_log` | Audit row per Linnworks→Square sync-tool run. UUID PK, mode, pulled/walked/created/updated/stock_only/no_op/failed/duplicate-SKU counts, error_summary. |
 
-See `supabase/001_initial.sql` for the actual schema.
-
-## What was tried and rejected
-
-(Empty so far — populate as we encounter dead-ends.)
+Schema in `supabase/001_initial.sql`. Idempotent — every `CREATE`
+uses `IF NOT EXISTS`. Re-run after any change, then
+`NOTIFY pgrst, 'reload schema';`.
 
 ## Diagnostic-first development pattern
 
 Per §10 of `LINNWORKS_REFERENCE.md`. Every endpoint shape we don't
 already know gets probed by a standalone script in `probes/` before
-production code is written against it. The probe script is preserved
-in the repo permanently — it's how we'll re-validate when an API
-silently changes.
+production code is written against it. The probe script stays in the
+repo permanently — it's how we re-validate when an API silently
+changes. This pattern is what produced the locked-in `CreateOrders`
+body shape, the mark-paid recipe, and the `product_type`-based
+catalog discriminator.
 
-## Where to start when resuming
+## What was tried and rejected
 
-1. Is the smoke test still passing? Run it manually from the Actions
-   tab. If yes, all credentials are good.
-2. What phase are we in? Check the table above and the most recent
-   workflow files committed.
-3. What's been discovered? Read `DISCOVERIES.md` (created in Phase 0b)
-   for endpoint shapes and tenant-specific facts.
-
-## Kevin's preferred working style
-
-(Carried over from sister project's CLAUDE.md.)
-
-- No coding background — uses Claude Code for all implementation via
-  detailed prompts.
-- GitHub Desktop for version control (not CLI git).
-- Prefers numbered update logs and step-by-step instructions.
-- Prefers visual UI feedback over silent terminal output.
-- Wants reliable solutions over fancy ones — was burned multiple
-  times by macOS permission battles during the Easyship build.
-
-## Likely next features (deferred from Phase 0a)
-
-- Phase 0b: the four diagnostic probes
-- Phase 1: reconciliation report
-- Phase 2 onwards as listed in the phasing table above
-- Slack notifications when a sync run fails (re-uses Slack token from
-  Easyship project — same workspace, same bot user)
+- `Orders/SetPaymentStatus`, `Orders/AddOrderPayment`,
+  `Orders/SetOrderPayment`, `Orders/PayOrder`,
+  `Orders/SetOrderParkedStatus` — all 404 on this tenant. Don't
+  re-test. Real mark-paid endpoint is `Orders/ChangeStatus` (after
+  unparking via `Orders/ChangeOrderTag`).
+- JSON-bodied call to `Orders/ChangeStatus` — returns 200 but
+  silently no-ops. Endpoint requires `application/x-www-form-urlencoded`.
+- Heuristic service detection via `available_for_booking` /
+  `service_duration` / `team_member_ids` — unreliable on this tenant.
+  Use `product_type == "APPOINTMENTS_SERVICE"` instead.
