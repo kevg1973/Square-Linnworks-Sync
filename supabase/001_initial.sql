@@ -130,6 +130,32 @@ CREATE INDEX IF NOT EXISTS idx_sq_wipe_log_run_at
     ON sq_wipe_log (run_at DESC);
 
 -- ============================================================================
+-- sq_lw_sync_log
+--   Audit log for tools/sync_linnworks_to_square.py. One row per run
+--   (observe or write). Mirrors sq_wipe_log's shape — UUID primary
+--   key, run_at, mode, then per-category counters and an error
+--   summary string. This is separate from sq_sync_runs (which is the
+--   cron job-tracking table used by lib/db.py).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS sq_lw_sync_log (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    mode                     TEXT NOT NULL,        -- 'observe' | 'write'
+    linnworks_items_pulled   INTEGER NOT NULL DEFAULT 0,
+    square_items_walked      INTEGER NOT NULL DEFAULT 0,
+    created                  INTEGER NOT NULL DEFAULT 0,
+    updated                  INTEGER NOT NULL DEFAULT 0,
+    stock_only               INTEGER NOT NULL DEFAULT 0,
+    no_op                    INTEGER NOT NULL DEFAULT 0,
+    failed                   INTEGER NOT NULL DEFAULT 0,
+    duplicate_skus           INTEGER NOT NULL DEFAULT 0,
+    error_summary            TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sq_lw_sync_log_run_at
+    ON sq_lw_sync_log (run_at DESC);
+
+-- ============================================================================
 -- updated_at triggers
 --   Cheap automatic updated_at on sku_map. We don't bother with
 --   triggers on the other tables because they're append-only or have
