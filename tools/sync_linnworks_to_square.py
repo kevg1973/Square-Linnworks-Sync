@@ -711,15 +711,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ---------- classify ----------
     creates, updates, stock_only, no_op = _classify(linnworks_items, square_map)
 
+    # The four action counts reflect *what the plan called for* and are
+    # set here, in the plan phase, regardless of mode. The write branch
+    # adds `failed` separately — it does not subtract from these counts.
+    # Reader convention: created=N failed=M means "N attempts, M didn't
+    # land, so N-M succeeded".
+    created_count = len(creates)
+    updated_count = len(updates)
+    stock_only_count = len(stock_only)
+    no_op_count = len(no_op)
+
     print("\n" + "=" * 70)
     print("=== PLAN ===")
     print("=" * 70)
     print(f"Linnworks items pulled (after limit): {len(linnworks_items)}")
     print(f"Square REGULAR SKUs walked:           {len(square_map)} (duplicate SKUs ignored: {duplicate_skus})")
-    print(f"Would CREATE:    {len(creates)}")
-    print(f"Would UPDATE:    {len(updates)}")
-    print(f"Would STOCK_ONLY:{len(stock_only)}")
-    print(f"Would NO_OP:     {len(no_op)}")
+    print(f"Would CREATE:    {created_count}")
+    print(f"Would UPDATE:    {updated_count}")
+    print(f"Would STOCK_ONLY:{stock_only_count}")
+    print(f"Would NO_OP:     {no_op_count}")
 
     _print_preview("CREATE", creates)
     _print_preview("UPDATE", updates)
@@ -733,17 +743,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             mode=mode,
             linnworks_pulled=len(linnworks_items),
             square_walked=len(square_map),
-            created=0,
-            updated=0,
-            stock_only=0,
-            no_op=len(no_op),
+            created=created_count,
+            updated=updated_count,
+            stock_only=stock_only_count,
+            no_op=no_op_count,
             failed=0,
             duplicate_skus=duplicate_skus,
             error_messages=[],
         )
         print(
-            f"\n=== SYNC COMPLETE: created=0 updated=0 stock_only=0 "
-            f"no_op={len(no_op)} failed=0 duplicate_skus={duplicate_skus} "
+            f"\n=== SYNC COMPLETE: created={created_count} "
+            f"updated={updated_count} stock_only={stock_only_count} "
+            f"no_op={no_op_count} failed=0 duplicate_skus={duplicate_skus} "
             f"(observe mode) ==="
         )
         return 0
@@ -751,14 +762,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ---------- write ----------
     print(
         f"\n=== WRITE MODE — about to issue Square catalog + inventory writes "
-        f"({len(creates)} create, {len(updates)} update, {len(stock_only)} stock-only) ==="
+        f"({created_count} create, {updated_count} update, {stock_only_count} stock-only) ==="
     )
 
     sku_to_new_var_id, create_fail, create_errors = _do_creates(creates)
-    create_count = len(creates) - create_fail
-
     update_fail, update_errors = _do_updates(updates)
-    update_count = len(updates) - update_fail
 
     # Build stock changes: CREATE (with new var ids), UPDATE (existing
     # var ids), STOCK_ONLY (existing var ids).
@@ -785,10 +793,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         mode=mode,
         linnworks_pulled=len(linnworks_items),
         square_walked=len(square_map),
-        created=create_count,
-        updated=update_count,
-        stock_only=len(stock_only),
-        no_op=len(no_op),
+        created=created_count,
+        updated=updated_count,
+        stock_only=stock_only_count,
+        no_op=no_op_count,
         failed=total_failed,
         duplicate_skus=duplicate_skus,
         error_messages=all_errors,
@@ -796,8 +804,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print("\n" + "=" * 70)
     print(
-        f"=== SYNC COMPLETE: created={create_count} updated={update_count} "
-        f"stock_only={len(stock_only)} no_op={len(no_op)} "
+        f"=== SYNC COMPLETE: created={created_count} updated={updated_count} "
+        f"stock_only={stock_only_count} no_op={no_op_count} "
         f"failed={total_failed} duplicate_skus={duplicate_skus} ==="
     )
     print("=" * 70)
