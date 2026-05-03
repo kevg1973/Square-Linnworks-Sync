@@ -1,35 +1,47 @@
-"""probes/probe_square_catalog.py — Phase 1 prep probe.
+"""probes/probe_square_catalog.py — Phase 1 prep probe (v2).
 
-Phase 2 (stock-push) and Phase 1 (reconciliation report) both need
-to know how SKUs join across the two systems. The hypothesis is
-"the SKU string in Linnworks equals `item_variation_data.sku` in
-Square". We need to confirm that against the live Northwest Guitars
-catalog before writing any join code.
+Phase 1 (reconciliation) and Phase 2 (stock-push) both need to know
+how SKUs join across the two systems and what the catalog actually
+looks like. v1 sampled 5 items but they were all Square Appointments
+**services** (Standard Guitar Setup, Headstock Repair, etc), not
+retail products — so the SKU join verdict was inconclusive. v2
+broadens the sample to 50 and categorises before printing so we see
+the catalog mix.
 
 Read-only. No mutations, writes, or deletes against either platform.
 
 ## What it does
 
-1. Sample 5 ITEM objects from Square via `POST /catalog/search`
-   with `include_related_objects: true`. Print each item's id,
-   name, variation count, and the FULL `item_variation_data` JSON
-   for every variation (so we can eyeball the SKU shape, price
-   structure, and any custom attributes).
+1. Fetch up to 50 ITEM objects from Square via `POST /catalog/search`
+   with `include_related_objects: true`.
 
-2. Cross-check inventory: take the variation IDs from step 1 and
-   call `POST /inventory/counts/batch-retrieve` against the pinned
-   shop location `L74KSP08AJ2GH`. Empty response means the location
-   ID is wrong; non-empty means it's correct.
+2. Classify each item:
+   - **service**: any variation has `available_for_booking: true`,
+     `service_duration` set, or `team_member_ids` populated.
+   - **multi-variation**: not a service AND has >1 variation.
+   - **retail**: everything else (one variation, no service markers).
 
-3. Cross-reference Linnworks: take 2 SKU strings found in Square
-   and call `Stock/GetStockItems` with `searchTypes: [0]` (search
-   by SKU). Print whether each SKU was found.
+3. Print a summary line and then up to 3 representative examples
+   per category — the FULL `item_variation_data` JSON for each
+   variation so we can eyeball the SKU/price/attribute shape.
 
-4. Print `=== DISCOVERY: ===` lines summarising:
-   - SKU join works (yes / no / partial)
-   - Square location ID correct (yes / no)
-   - Typical variation count per item
-   - Whether any custom attributes appear
+4. Cross-check inventory: take the variation IDs from the first 5
+   retail items and call `POST /inventory/counts/batch-retrieve`
+   against the pinned shop location `L74KSP08AJ2GH`. Empty response
+   means the location ID is wrong.
+
+5. Cross-reference Linnworks: the same 5 retail SKUs go through
+   `Stock/GetStockItems` with `searchTypes: [0]` (search by SKU).
+   The response shape is `{"PageNumber": ..., "Data": [...],
+   "TotalEntries": ..., ...}` — v1 mis-parsed this as a bare list,
+   v2 reads `Data[0]` when `TotalEntries > 0`.
+
+6. Print `=== DISCOVERY: ===` lines summarising catalog
+   composition, SKU join verdict, location ID correctness,
+   unmatched SKU list, multi-variation pattern, and the
+   `IsNotTrackable` values from matched Linnworks records (so we
+   can tell whether Linnworks marks services / non-stock items as
+   untracked).
 
 The output is meant to be eyeballed; nothing is written back to
 DISCOVERIES.md automatically.
@@ -44,18 +56,17 @@ from typing import Any, Optional
 from lib import linnworks, square
 
 
-# Pinned in Phase 0a. Inventory counts are per-location in Square.
 SHOP_LOCATION_ID = "L74KSP08AJ2GH"
 
-ITEMS_TO_SAMPLE = 5
-SKUS_TO_CROSSCHECK = 2
+ITEMS_TO_SAMPLE = 50
+EXAMPLES_PER_CATEGORY = 3
+RETAIL_SKUS_TO_CROSSCHECK = 5
 
 
 # ---------- step 1: sample catalog items ----------
 
 
 def _search_catalog_items(limit: int) -> dict[str, Any]:
-    """POST /catalog/search — read-only catalog query."""
     body = {
         "object_types": ["ITEM"],
         "limit": limit,
@@ -68,22 +79,47 @@ def _search_catalog_items(limit: int) -> dict[str, Any]:
     return result or {}
 
 
-def _print_item_summary(item: dict[str, Any]) -> list[dict[str, Any]]:
-    """Pretty-print one item and return its variation dicts."""
+# ---------- step 2: classification ----------
+
+
+def _is_service_variation(var: dict[str, Any]) -> bool:
+    var_data = var.get("item_variation_data") or {}
+    if var_data.get("available_for_booking") is True:
+        return True
+    if var_data.get("service_duration") is not None:
+        return True
+    if var_data.get("team_member_ids"):
+        return True
+    return False
+
+
+def _classify(item: dict[str, Any]) -> str:
+    variations = (item.get("item_data") or {}).get("variations") or []
+    if any(_is_service_variation(v) for v in variations):
+        return "service"
+    if len(variations) > 1:
+        return "multi-variation"
+    return "retail"
+
+
+# ---------- step 3: per-item printing ----------
+
+
+def _print_item_full(item: dict[str, Any], header: str) -> None:
     item_id = item.get("id")
-    item_data = item.get("item_data", {}) if isinstance(item.get("item_data"), dict) else {}
+    item_data = item.get("item_data") or {}
     name = item_data.get("name")
-    variations = item_data.get("variations", []) or []
+    variations = item_data.get("variations") or []
     custom_attrs = item.get("custom_attribute_values") or {}
 
-    print(f"\n  ━━━ ITEM ━━━")
+    print(f"\n  ━━━ {header} ━━━")
     print(f"    id:               {item_id}")
     print(f"    item_data.name:   {name!r}")
     print(f"    variation count:  {len(variations)}")
     print(f"    custom_attribute_values: {json.dumps(custom_attrs, default=str)}")
 
     for i, var in enumerate(variations, start=1):
-        var_data = var.get("item_variation_data", {}) if isinstance(var.get("item_variation_data"), dict) else {}
+        var_data = var.get("item_variation_data") or {}
         print(f"\n    -- variation {i}/{len(variations)} --")
         print(f"      variation id:                       {var.get('id')}")
         print(f"      item_variation_data.name:           {var_data.get('name')!r}")
@@ -91,10 +127,8 @@ def _print_item_summary(item: dict[str, Any]) -> list[dict[str, Any]]:
         print(f"      item_variation_data.price_money:    {json.dumps(var_data.get('price_money'), default=str)}")
         print(f"      FULL item_variation_data:           {json.dumps(var_data, default=str, indent=8)}")
 
-    return variations
 
-
-# ---------- step 2: inventory cross-check ----------
+# ---------- step 4: inventory cross-check ----------
 
 
 def _check_inventory(variation_ids: list[str]) -> dict[str, Any]:
@@ -102,7 +136,7 @@ def _check_inventory(variation_ids: list[str]) -> dict[str, Any]:
         "catalog_object_ids": variation_ids,
         "location_ids": [SHOP_LOCATION_ID],
     }
-    print(f"\n--- step 2: POST /inventory/counts/batch-retrieve ---")
+    print(f"\n--- step 4: POST /inventory/counts/batch-retrieve (retail variations only) ---")
     print(f"    body: {json.dumps(body)}")
     result = square.call("inventory/counts/batch-retrieve", method="POST", json_body=body)
     counts = (result or {}).get("counts", []) or []
@@ -111,13 +145,16 @@ def _check_inventory(variation_ids: list[str]) -> dict[str, Any]:
     return result or {}
 
 
-# ---------- step 3: linnworks cross-reference ----------
+# ---------- step 5: linnworks cross-reference ----------
 
 
 def _linnworks_find_sku(sku: str) -> tuple[bool, Optional[dict[str, Any]]]:
     """Call Stock/GetStockItems with the SKU as the keyword. Returns
-    (found, first_match_dict). searchTypes=[0] is search-by-SKU per
-    LINNWORKS_REFERENCE.md.
+    (exact_match_found, first_data_dict).
+
+    Response shape (per a prior run):
+      {"PageNumber": int, "EntriesPerPage": int, "TotalEntries": int,
+       "TotalPages": int, "Data": [<stock item>, ...]}
     """
     body = {
         "keyword": sku,
@@ -135,22 +172,27 @@ def _linnworks_find_sku(sku: str) -> tuple[bool, Optional[dict[str, Any]]]:
         print(f"     REQUEST FAILED: {type(e).__name__}: {e}")
         return (False, None)
 
-    if not isinstance(result, list):
+    if not isinstance(result, dict):
         print(f"     unexpected response shape ({type(result).__name__}): {json.dumps(result, default=str)[:300]}")
         return (False, None)
 
-    print(f"     {len(result)} match(es)")
-    if not result:
+    total = result.get("TotalEntries", 0)
+    data = result.get("Data") or []
+    print(f"     TotalEntries={total}, returned {len(data)} record(s) in Data")
+
+    if total <= 0 or not data:
         return (False, None)
-    first = result[0] if isinstance(result[0], dict) else {}
+
+    first = data[0] if isinstance(data[0], dict) else {}
     print(
-        f"     first match: SKU={first.get('ItemNumber')!r}  "
-        f"Title={first.get('ItemTitle')!r}  "
-        f"StockItemId={first.get('StockItemId')}"
+        f"     first match: ItemNumber={first.get('ItemNumber')!r}  "
+        f"ItemTitle={first.get('ItemTitle')!r}  "
+        f"Quantity={first.get('Quantity')}  "
+        f"IsNotTrackable={first.get('IsNotTrackable')}"
     )
-    # Linnworks keyword search may match prefix/contains rather than
-    # exact — explicitly verify the returned ItemNumber equals our SKU.
-    exact = any(isinstance(r, dict) and r.get("ItemNumber") == sku for r in result)
+
+    # Linnworks keyword search may match prefix/contains, not exact.
+    exact = any(isinstance(r, dict) and r.get("ItemNumber") == sku for r in data)
     print(f"     exact ItemNumber match for {sku!r}: {exact}")
     return (exact, first)
 
@@ -159,93 +201,154 @@ def _linnworks_find_sku(sku: str) -> tuple[bool, Optional[dict[str, Any]]]:
 
 
 def main() -> int:
-    print("--- probe_square_catalog (Phase 1 prep — SKU join discovery) ---")
+    print("--- probe_square_catalog (v2 — broader sample, retail focus) ---")
 
-    # Step 1
     search_response = _search_catalog_items(ITEMS_TO_SAMPLE)
     items = search_response.get("objects") or []
     if not items:
         print("=== DISCOVERY: /catalog/search returned 0 items — catalog may be empty ===")
         return 2
 
-    print(f"\n=== sampled {len(items)} ITEM object(s) from Square catalog ===")
-    all_variation_ids: list[str] = []
-    all_skus: list[str] = []
-    variation_counts: list[int] = []
-    items_with_custom_attrs = 0
+    # ---------- step 2 — classify ----------
+    by_category: dict[str, list[dict[str, Any]]] = {
+        "service": [],
+        "multi-variation": [],
+        "retail": [],
+    }
     for item in items:
-        variations = _print_item_summary(item)
-        variation_counts.append(len(variations))
-        if item.get("custom_attribute_values"):
-            items_with_custom_attrs += 1
-        for var in variations:
-            vid = var.get("id")
-            if vid:
-                all_variation_ids.append(vid)
-            sku = (var.get("item_variation_data") or {}).get("sku")
-            if sku:
-                all_skus.append(sku)
+        by_category[_classify(item)].append(item)
 
-    # Step 2
-    if not all_variation_ids:
-        print("=== DISCOVERY: no variations on any sampled item — cannot cross-check inventory ===")
+    n_total = len(items)
+    n_service = len(by_category["service"])
+    n_multi = len(by_category["multi-variation"])
+    n_retail = len(by_category["retail"])
+
+    print("\n" + "=" * 70)
+    print(
+        f"=== Sampled {n_total} items: "
+        f"{n_service} service, {n_multi} multi-variation, {n_retail} retail ==="
+    )
+    print("=" * 70)
+
+    # ---------- step 3 — print up to 3 examples per category ----------
+    for category in ("service", "multi-variation", "retail"):
+        bucket = by_category[category]
+        if not bucket:
+            print(f"\n=== category '{category}': none in sample ===")
+            continue
+        print(
+            f"\n=== category '{category}': showing "
+            f"{min(EXAMPLES_PER_CATEGORY, len(bucket))} of {len(bucket)} ==="
+        )
+        for i, item in enumerate(bucket[:EXAMPLES_PER_CATEGORY], start=1):
+            _print_item_full(item, header=f"{category.upper()} #{i}")
+
+    # ---------- pick the 5 retail items for cross-checking ----------
+    retail_picks = by_category["retail"][:RETAIL_SKUS_TO_CROSSCHECK]
+    retail_variation_ids: list[str] = []
+    retail_skus: list[str] = []
+    for item in retail_picks:
+        variations = (item.get("item_data") or {}).get("variations") or []
+        if not variations:
+            continue
+        var = variations[0]
+        var_data = var.get("item_variation_data") or {}
+        vid = var.get("id")
+        sku = var_data.get("sku")
+        if vid:
+            retail_variation_ids.append(vid)
+        if sku:
+            retail_skus.append(sku)
+
+    # ---------- step 4 — inventory cross-check (retail only) ----------
+    if not retail_variation_ids:
+        print("\n=== no retail variations available for inventory cross-check ===")
         inventory_ok = False
+        inventory_count = 0
     else:
-        inv = _check_inventory(all_variation_ids)
-        inventory_ok = bool((inv or {}).get("counts"))
+        inv = _check_inventory(retail_variation_ids)
+        counts = (inv or {}).get("counts") or []
+        inventory_count = len(counts)
+        inventory_ok = inventory_count > 0
 
-    # Step 3
-    print(f"\n--- step 3: cross-reference up to {SKUS_TO_CROSSCHECK} Square SKU(s) against Linnworks ---")
-    sku_results: list[tuple[str, bool]] = []
-    for sku in all_skus[:SKUS_TO_CROSSCHECK]:
-        found, _ = _linnworks_find_sku(sku)
-        sku_results.append((sku, found))
+    # ---------- step 5 — linnworks cross-reference (retail SKUs) ----------
+    print(
+        f"\n--- step 5: cross-reference up to {RETAIL_SKUS_TO_CROSSCHECK} "
+        f"retail Square SKU(s) against Linnworks ---"
+    )
+    sku_results: list[tuple[str, bool, Optional[dict[str, Any]]]] = []
+    for sku in retail_skus:
+        found, record = _linnworks_find_sku(sku)
+        sku_results.append((sku, found, record))
     if not sku_results:
-        print("     no SKUs found in Square sample — nothing to cross-check")
+        print("     no retail SKUs found in Square sample — nothing to cross-check")
 
-    # ---------- step 4: discovery summary ----------
+    matched = [(s, r) for s, ok, r in sku_results if ok and r is not None]
+    unmatched_skus = [s for s, ok, _ in sku_results if not ok]
+    is_not_trackable_values = [r.get("IsNotTrackable") for _, r in matched]
+
+    # ---------- step 6 — discovery summary ----------
     print("\n" + "=" * 70)
     print("=== DISCOVERY SUMMARY ===")
     print("=" * 70)
 
-    # SKU join verdict
-    if not sku_results:
-        sku_verdict = "no — Square sample had no SKUs to test"
-    else:
-        hits = sum(1 for _, ok in sku_results if ok)
-        if hits == len(sku_results):
-            sku_verdict = f"yes — {hits}/{len(sku_results)} Square SKUs matched ItemNumber in Linnworks exactly"
-        elif hits == 0:
-            sku_verdict = f"no — 0/{len(sku_results)} Square SKUs found in Linnworks (different SKU schemes)"
-        else:
-            sku_verdict = f"partial — {hits}/{len(sku_results)} Square SKUs matched (sample too small to be conclusive)"
-    print(f"=== DISCOVERY: SKU join (Linnworks ItemNumber == Square item_variation_data.sku): {sku_verdict} ===")
-
-    # Location verdict
     print(
-        f"=== DISCOVERY: Square location ID {SHOP_LOCATION_ID!r} correct for inventory: "
-        f"{'yes' if inventory_ok else 'no — inventory/counts/batch-retrieve returned empty'} ==="
+        f"=== DISCOVERY: Catalog composition: "
+        f"{n_service} service, {n_multi} multi-variation, {n_retail} retail "
+        f"(out of {n_total} sampled) ==="
     )
 
-    # Variation count verdict
-    if variation_counts:
-        avg = sum(variation_counts) / len(variation_counts)
-        multi = sum(1 for n in variation_counts if n > 1)
-        if multi == 0:
-            var_verdict = f"single variation per item (all {len(variation_counts)} sampled items have 1)"
-        elif multi == len(variation_counts):
-            var_verdict = f"multiple variations per item (all {len(variation_counts)} sampled items have >1; avg {avg:.1f})"
-        else:
-            var_verdict = f"mixed ({multi}/{len(variation_counts)} sampled items have >1 variation; avg {avg:.1f})"
+    if not sku_results:
+        sku_verdict = "n/a — no retail SKUs in sample to test"
     else:
-        var_verdict = "no variations seen"
-    print(f"=== DISCOVERY: variation pattern: {var_verdict} ===")
-
-    # Custom attrs verdict
+        hits = sum(1 for _, ok, _ in sku_results if ok)
+        verdict_word = (
+            "yes" if hits == len(sku_results)
+            else "no" if hits == 0
+            else "partial"
+        )
+        sku_verdict = f"{verdict_word} — {hits}/{len(sku_results)} retail SKUs found in Linnworks"
     print(
-        f"=== DISCOVERY: custom attributes on items: "
-        f"{'yes' if items_with_custom_attrs > 0 else 'no'} "
-        f"({items_with_custom_attrs}/{len(items)} sampled items have custom_attribute_values) ==="
+        f"=== DISCOVERY: SKU join (retail Square SKU == Linnworks ItemNumber): "
+        f"{sku_verdict} ==="
+    )
+
+    print(
+        f"=== DISCOVERY: Square location {SHOP_LOCATION_ID!r} returns inventory "
+        f"for retail items: "
+        f"{'yes — ' + str(inventory_count) + ' counts returned' if inventory_ok else 'no — empty response'} ==="
+    )
+
+    if unmatched_skus:
+        print(
+            f"=== DISCOVERY: For unmatched SKUs, the SKU strings were: "
+            f"{json.dumps(unmatched_skus)} ==="
+        )
+    else:
+        print(
+            "=== DISCOVERY: For unmatched SKUs, the SKU strings were: "
+            "[] (no unmatched SKUs in sample) ==="
+        )
+
+    if n_multi == 0:
+        multi_verdict = "none in sample"
+    else:
+        per_item = []
+        for it in by_category["multi-variation"][:EXAMPLES_PER_CATEGORY]:
+            variations = (it.get("item_data") or {}).get("variations") or []
+            sku_list = [
+                (v.get("item_variation_data") or {}).get("sku") for v in variations
+            ]
+            per_item.append(
+                f"{(it.get('item_data') or {}).get('name')!r} → "
+                f"{len(variations)} variations, SKUs={json.dumps(sku_list)}"
+            )
+        multi_verdict = f"{n_multi} multi-variation items in sample. Examples: " + " | ".join(per_item)
+    print(f"=== DISCOVERY: Multi-variation pattern: {multi_verdict} ===")
+
+    print(
+        f"=== DISCOVERY: Linnworks IsNotTrackable values for matched SKUs: "
+        f"{json.dumps(is_not_trackable_values)} ==="
     )
 
     return 0
