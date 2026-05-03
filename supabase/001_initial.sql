@@ -108,6 +108,28 @@ CREATE TABLE IF NOT EXISTS sq_watermarks (
 );
 
 -- ============================================================================
+-- sq_wipe_log
+--   Audit log for tools/wipe_square_items.py. One row per run
+--   (observe or write), so we can always look up "when was the last
+--   wipe and what did it touch?". Mode='observe' rows are dry runs
+--   that didn't delete anything; mode='write' rows record actual
+--   deletions.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS sq_wipe_log (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    mode                  TEXT NOT NULL,        -- 'observe' | 'write'
+    items_walked          INTEGER NOT NULL DEFAULT 0,
+    items_deleted         INTEGER NOT NULL DEFAULT 0,
+    items_failed          INTEGER NOT NULL DEFAULT 0,
+    items_kept_services   INTEGER NOT NULL DEFAULT 0,
+    error_summary         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sq_wipe_log_run_at
+    ON sq_wipe_log (run_at DESC);
+
+-- ============================================================================
 -- updated_at triggers
 --   Cheap automatic updated_at on sku_map. We don't bother with
 --   triggers on the other tables because they're append-only or have
