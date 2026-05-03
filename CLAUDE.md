@@ -69,11 +69,22 @@ the shop reopens Tuesday morning.**
 | Would STOCK_ONLY                      | 2,338 |
 | Would NO_OP                           | 1,350 |
 
-⚠️ **Known bug**: the final `=== SYNC COMPLETE: ===` summary line
-showed `created=0 updated=0 stock_only=0` despite the per-action plan
-having 105 / 400 / 2,338. The plan numbers are correct; the summary
-tally is broken (likely a counter-reset bug). Verify and fix before
-the write-mode run — see *Open issues* below.
+**Recent fixes (since the latest observe run)**:
+
+- Linnworks pagination now terminates cleanly via partial-page
+  detection (and treats a follow-up HTTP 400 as expected
+  end-of-catalog only when the previous page was already partial).
+  Was previously propagating the 400 from page 22 as an error.
+  Commit `4787c4c`.
+- The final `=== SYNC COMPLETE: ===` summary line and the
+  `sq_lw_sync_log` audit row now use plan-phase action counts
+  (`len(creates)` etc.) regardless of mode, with `failed` tracked
+  separately. The previous version hardcoded zeros in observe mode
+  and double-counted failures in write mode. Commit `cde7412`.
+
+A re-run in observe mode is the next sanity check before write-mode
+can be trusted — the summary line should now match the PLAN block
+exactly.
 
 ## Discoveries to remember
 
@@ -218,15 +229,25 @@ Square-Linnworks-Sync/
 
 ## Cutover plan (target: Monday before EOD)
 
+**Precondition** (do this once before any of the steps below):
+paste the contents of `supabase/001_initial.sql` into the Supabase
+SQL Editor and run, then run `NOTIFY pgrst, 'reload schema';` in a
+fresh query. The migration is idempotent (every CREATE uses
+`IF NOT EXISTS`), and the NOTIFY is what makes PostgREST's API
+actually see new tables — without it, audit-row inserts fail with
+`PGRST205` even when the table exists in the database.
+
 1. Re-run **Sync — Linnworks → Square** in observe mode. Verify the
-   breakdown still looks right (≈4,193 Linnworks items, ≈7,381
-   would-delete in Square, mostly CREATE after wipe).
+   summary line now matches the PLAN block exactly (post-`cde7412`
+   fix), and the breakdown still looks sensible (≈4,193 Linnworks
+   items, mostly CREATE after wipe).
 2. Maintenance window opens (shop closed).
 3. Run **Wipe — Square retail items** with `mode=write`. Deletes
-   7,381 retail, keeps 9 services.
+   ≈7,381 retail items, keeps 9 services. Audit row in `sq_wipe_log`.
 4. Verify Square dashboard shows only services in the Item library.
 5. Run **Sync — Linnworks → Square** with `mode=write`. Creates
-   ≈4,193 retail items, sets stock from Linnworks.
+   ≈4,193 retail items and pushes stock from Linnworks. Audit row
+   in `sq_lw_sync_log`.
 6. Verify Square dashboard populated correctly.
 7. Kill the legacy sync app.
 8. Monitor for an hour.
@@ -234,21 +255,53 @@ Square-Linnworks-Sync/
 
 ## Open issues / next session
 
-- **Sync's final summary line is broken.** Showed
-  `created=0 updated=0 stock_only=0` in the latest observe run despite
-  the plan having 105 / 400 / 2,338. The per-category plan numbers
-  are correct; only the summary tally is wrong. Verify and fix
-  before the write-mode run.
-- **`sq_lw_sync_log` schema cache.** The migration created the table
-  but PostgREST's schema cache wasn't refreshed in time for the
-  latest run, so the audit insert failed with
-  `PGRST205 — Could not find the table 'public.sq_lw_sync_log' in the
-  schema cache`. Always run `NOTIFY pgrst, 'reload schema';` in the
-  Supabase SQL editor after applying a migration.
-- **Image sync deferred.** Basic SKU/name/price/stock first; product
+**Pre-cutover checklist** (must clear before any `--write` run):
+
+- **Run the migration.** Editing `supabase/001_initial.sql` in the
+  repo only changes the file — it does not touch the live database.
+  `sq_lw_sync_log` was added to the SQL on 2026-05-03 but the
+  CREATE wasn't actually executed against Supabase until the
+  audit-insert started failing with `PGRST205`. Always do **both**
+  in the Supabase SQL Editor after a migration change: paste the
+  full file → Run, then run `NOTIFY pgrst, 'reload schema';` so
+  PostgREST sees the new tables. The schema-cache `NOTIFY` alone
+  doesn't create anything.
+- **Confirm the observe-run summary line matches the PLAN block**
+  after the `cde7412` counter fix. If they don't match for any
+  reason, do not run `--write` yet.
+
+**Deferred (out of cutover scope)**:
+
+- **Image sync.** Basic SKU/name/price/stock first; product
   pictures are a follow-up after cutover.
 - **Per-supplier code cache, sales velocity ingest from Script 47**,
-  etc. — out of scope for cutover.
+  etc.
+- **Promote `SQUARE_LOCATION_ID` to an env var.** Currently
+  hardcoded as `L74KSP08AJ2GH` across the tools. Lift to config
+  when the Phase 2 cron lands.
+- **`sq_sku_map` is unused.** Schema exists but nothing writes to
+  it yet; the sync re-derives the SKU↔catalog-id mapping on every
+  observe/write run by walking Square's catalog. Phase 2 cron will
+  populate this table to skip no-op writes between runs.
+
+**Phase 2/3 still to build**:
+
+- **Phase 2 — stock-push cron** (`stock-push.yml`, every 15 min,
+  Linnworks → Square). The Phase 1 sync tool is a one-shot manual
+  rebuild; the cron is the recurring delta sync. Most of the
+  Linnworks pull / Square upsert / inventory-push code can lift
+  directly from the sync tool.
+- **Phase 3 — order-pull cron** (`order-pull.yml`, every 5 min,
+  Square → Linnworks). Creates Linnworks orders from Square POS
+  sales. Mark-paid recipe is locked in (see *Discoveries*) — the
+  build is mostly: pull Square orders since watermark, idempotently
+  create Linnworks orders, unpark via `ChangeOrderTag`, mark paid
+  via `ChangeStatus(status=1)`, advance watermark.
+- **Phase 4 — operational dashboard.** Reads `sq_sync_runs`,
+  `sq_errors`, `sq_wipe_log`, `sq_lw_sync_log`, surfaces last-run
+  status and recent errors. Shape TBD.
+- **Phase 5 — orphan-deletion path on reconciliation** with a
+  confirm step.
 
 ## Operational gotchas
 
