@@ -50,6 +50,7 @@ involve no API writes at all.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 import uuid
@@ -166,6 +167,13 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
             print(f"    page {page_number} empty — Linnworks pull complete")
             break
         print(f"    {len(page_items)} item(s) returned")
+
+        # DEBUG: dump full structure of first item on first page so we
+        # can see what fields Linnworks returns (category, variation
+        # flags, etc). Remove once we've identified the field names.
+        if page_number == 1 and page_items:
+            print("    [DEBUG] full first-item dict:")
+            print(json.dumps(page_items[0], indent=2, default=str))
 
         for it in page_items:
             sku = (it.get("ItemNumber") or "").strip()
