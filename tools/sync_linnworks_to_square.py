@@ -50,7 +50,6 @@ involve no API writes at all.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 import uuid
@@ -77,6 +76,20 @@ SLEEP_BETWEEN_BATCHES = 0.2
 PREVIEW_PER_CATEGORY = 20
 
 PRODUCT_TYPE_REGULAR = "REGULAR"
+
+# Linnworks items we never want to sync to Square. Filtered at
+# ingestion time (inside _pull_linnworks_items) so they never enter
+# the working set. Keep these lists narrow and amend deliberately.
+EXCLUDED_CATEGORY_SUBSTRINGS = frozenset({
+    "reverse auction",
+    "competition winners",
+    "b stock",
+})
+EXCLUDED_SKUS = frozenset({
+    "Custom Order",
+    "571-2828362",
+    "571-2828365",
+})
 
 
 # ---------- Linnworks pull ----------
@@ -141,6 +154,9 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
     """
     items: list[dict[str, Any]] = []
     skipped_no_sku = 0
+    skipped_variation_parent = 0
+    skipped_category_excluded = 0
+    skipped_skulist = 0
     prev_page_count: Optional[int] = None
 
     for page_number in range(1, LW_PAGE_SAFETY_CAP + 1):
@@ -168,17 +184,23 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
             break
         print(f"    {len(page_items)} item(s) returned")
 
-        # DEBUG: dump full structure of first item on first page so we
-        # can see what fields Linnworks returns (category, variation
-        # flags, etc). Remove once we've identified the field names.
-        if page_number == 1 and page_items:
-            print("    [DEBUG] full first-item dict:")
-            print(json.dumps(page_items[0], indent=2, default=str))
-
         for it in page_items:
             sku = (it.get("ItemNumber") or "").strip()
             if not sku:
                 skipped_no_sku += 1
+                continue
+
+            if it.get("IsVariationParent"):
+                skipped_variation_parent += 1
+                continue
+
+            category_lower = (it.get("CategoryName") or "").lower()
+            if any(sub in category_lower for sub in EXCLUDED_CATEGORY_SUBSTRINGS):
+                skipped_category_excluded += 1
+                continue
+
+            if sku in EXCLUDED_SKUS:
+                skipped_skulist += 1
                 continue
 
             try:
@@ -211,7 +233,13 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
             f"catalog larger than expected, raise the cap !!!"
         )
 
-    print(f"\n=== Linnworks pull: {len(items)} item(s) collected, {skipped_no_sku} skipped (null/empty SKU) ===")
+    print(
+        f"\n=== Linnworks pull: {len(items)} item(s) collected, "
+        f"{skipped_no_sku} skipped (null/empty SKU), "
+        f"{skipped_variation_parent} variation parents skipped, "
+        f"{skipped_category_excluded} category-excluded skipped, "
+        f"{skipped_skulist} SKU-list skipped ==="
+    )
     return items
 
 
