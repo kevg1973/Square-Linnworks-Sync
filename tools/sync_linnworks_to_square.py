@@ -90,6 +90,7 @@ EXCLUDED_SKUS = frozenset({
     "Custom Order",
     "571-2828362",
     "571-2828365",
+    "GTR-001",
 })
 
 
