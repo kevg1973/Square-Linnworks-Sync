@@ -83,6 +83,7 @@ PRODUCT_TYPE_REGULAR = "REGULAR"
 EXCLUDED_CATEGORY_SUBSTRINGS = frozenset({
     "reverse auction",
     "competition winners",
+    "competition prizes",
     "b stock",
 })
 EXCLUDED_SKUS = frozenset({
@@ -157,6 +158,7 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
     skipped_variation_parent = 0
     skipped_category_excluded = 0
     skipped_skulist = 0
+    skipped_no_price = 0
     prev_page_count: Optional[int] = None
 
     for page_number in range(1, LW_PAGE_SAFETY_CAP + 1):
@@ -185,13 +187,14 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
         print(f"    {len(page_items)} item(s) returned")
 
         for it in page_items:
+            # Skip checks ordered cheapest-first.
             sku = (it.get("ItemNumber") or "").strip()
             if not sku:
                 skipped_no_sku += 1
                 continue
 
-            if it.get("IsVariationParent"):
-                skipped_variation_parent += 1
+            if sku in EXCLUDED_SKUS:
+                skipped_skulist += 1
                 continue
 
             category_lower = (it.get("CategoryName") or "").lower()
@@ -199,14 +202,17 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
                 skipped_category_excluded += 1
                 continue
 
-            if sku in EXCLUDED_SKUS:
-                skipped_skulist += 1
+            if it.get("IsVariationParent"):
+                skipped_variation_parent += 1
                 continue
 
             try:
                 price = float(it.get("RetailPrice") or 0)
             except (TypeError, ValueError):
                 price = 0.0
+            if price <= 0:
+                skipped_no_price += 1
+                continue
             price_pence = int(round(price * 100))
 
             barcode = (it.get("BarcodeNumber") or "").strip() or None
@@ -238,7 +244,8 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
         f"{skipped_no_sku} skipped (null/empty SKU), "
         f"{skipped_variation_parent} variation parents skipped, "
         f"{skipped_category_excluded} category-excluded skipped, "
-        f"{skipped_skulist} SKU-list skipped ==="
+        f"{skipped_skulist} SKU-list skipped, "
+        f"{skipped_no_price} no-price skipped ==="
     )
     return items
 
