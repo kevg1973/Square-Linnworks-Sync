@@ -1,13 +1,14 @@
 name: Pull — Square orders → Linnworks
 
-# Manual trigger only for now. The schedule block below is
-# COMMENTED OUT deliberately — we're running a few manual
-# observe-mode + write-mode tests before the cron starts firing
-# automatically. To enable the 5-minute cron after manual
-# verification, uncomment the `schedule:` block.
+# Two triggers:
+#   - schedule: every 5 min, always --write, no limit (the cron).
+#   - workflow_dispatch: manual run with mode (observe/write) and
+#     optional limit; kept for ad-hoc dry runs and one-off backfills.
+# Concurrency group below ensures only one pull runs at a time so a
+# slow run can't overlap with the next cron tick.
 on:
-  # schedule:
-  #   - cron: '*/5 * * * *'
+  schedule:
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       mode:
