@@ -156,6 +156,30 @@ CREATE INDEX IF NOT EXISTS idx_sq_lw_sync_log_run_at
     ON sq_lw_sync_log (run_at DESC);
 
 -- ============================================================================
+-- sq_orders_pull_log
+--   Audit log for tools/pull_square_orders_to_linnworks.py. One row
+--   per run (observe or write). Mirrors sq_wipe_log / sq_lw_sync_log
+--   shape — UUID primary key, run_at, mode, then per-category
+--   counters and an error summary string. Records the watermark
+--   before/after so we can reconstruct windows from the log alone.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS sq_orders_pull_log (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    mode               TEXT NOT NULL,        -- 'observe' | 'write'
+    watermark_before   TIMESTAMPTZ,
+    watermark_after    TIMESTAMPTZ,
+    orders_fetched     INTEGER NOT NULL DEFAULT 0,
+    orders_processed   INTEGER NOT NULL DEFAULT 0,
+    orders_skipped     INTEGER NOT NULL DEFAULT 0,
+    orders_failed      INTEGER NOT NULL DEFAULT 0,
+    error_summary      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sq_orders_pull_log_run_at
+    ON sq_orders_pull_log (run_at DESC);
+
+-- ============================================================================
 -- updated_at triggers
 --   Cheap automatic updated_at on sku_map. We don't bother with
 --   triggers on the other tables because they're append-only or have

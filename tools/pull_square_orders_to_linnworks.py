@@ -1,0 +1,658 @@
+"""tools/pull_square_orders_to_linnworks.py — Phase 3.
+
+Pulls COMPLETED Square POS orders updated since the last
+watermark and creates matching orders in Linnworks. Idempotent
+via sq_square_orders_processed (Square order id is the dedup
+key) plus Linnworks' own (Source, SubSource, ReferenceNumber)
+natural dedup as a backstop.
+
+## Safety posture
+
+- Default observe-mode (--write to actually call Linnworks
+  CreateOrders). Observe runs print the planned payload for the
+  first few orders, never write to Linnworks, never insert into
+  sq_square_orders_processed, and never advance the watermark.
+- Per-order failures don't crash the run — they're logged to
+  sq_errors via lib.db.log_error and the next order is attempted.
+- The watermark only advances after a successful write run with
+  ≥1 order processed. New value = max(updated_at) over the
+  successfully-created orders. Failed orders stay in-window for
+  the next run to retry.
+- Audit row written to sq_orders_pull_log per run.
+
+## Watermark logic
+
+- Read from sq_watermarks where key='square_orders_pulled'.
+- If absent: default to now − 7 days (initial backfill window).
+- Pull window: updated_at >= (watermark − 60 seconds). The 60s
+  back-step handles Square's eventual consistency on
+  updated_at without re-doing too much work.
+
+## SKU resolution
+
+- Per Square line_item: catalog_object_id is the Square ITEM_VARIATION
+  id. Looked up in sq_sku_map.square_variation_id → sku.
+- Misses (e.g. Appointments services not in our retail catalog,
+  ad-hoc POS items) fall back to using line_item.name as the
+  SKU stand-in. Linnworks treats unknown SKUs as ad-hoc lines
+  (no stock movement) — matching the legacy POS app's behaviour
+  for services.
+
+## Linnworks order shape
+
+Per the locked-in CreateOrders recipe in DISCOVERIES.md §3:
+
+  - Source = "SQUAREPOS"
+  - SubSource = "# <square-order-id>"
+  - ReferenceNumber = ExternalReferenceNumber = <square-order-id>
+  - LocationId = 00000000-0000-0000-0000-000000000000 (Default)
+  - Currency = GBP
+  - DeliveryAddress = BillingAddress (same shape; placeholder
+    fallback for missing fields — POS sales typically have no
+    shipping recipient).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+from lib import db, linnworks, square
+
+
+# ---------- constants ----------
+
+WATERMARK_KEY = "square_orders_pulled"
+WATERMARK_BACKSTEP_SECONDS = 60
+DEFAULT_LOOKBACK_DAYS = 7
+
+SHOP_LOCATION_ID = "L74KSP08AJ2GH"
+LINNWORKS_DEFAULT_LOCATION = "00000000-0000-0000-0000-000000000000"
+JOB_NAME = "pull-square-orders"
+
+ORDER_PAGE_LIMIT = 100
+SKU_MAP_PAGE_SIZE = 1000
+PROCESSED_LOOKUP_CHUNK = 200
+PLAN_PREVIEW = 5
+
+# Placeholder for fields the Square order doesn't supply. POS sales
+# rarely include a shipment recipient, so we fall back to the shop's
+# own address — keeps Linnworks happy without leaking customer data
+# we never had.
+PLACEHOLDER_ADDRESS: dict[str, str] = {
+    "FullName":     "Square Customer",
+    "Company":      "",
+    "EmailAddress": "orders@northwestguitars.co.uk",
+    "PhoneNumber":  "0700000000",
+    "Address1":     "Unit A",
+    "Address2":     "Hoyle Street",
+    "Address3":     "",
+    "Town":         "Warrington",
+    "Region":       "Cheshire",
+    "PostCode":     "WA5 0LW",
+    "Country":      "United Kingdom",
+    "CountryCode":  "GB",
+}
+
+# Minimal ISO-code → country-name map. Extend as needed; falls back
+# to the code itself for anything not listed.
+COUNTRY_NAME: dict[str, str] = {
+    "GB": "United Kingdom",
+    "US": "United States",
+    "IE": "Ireland",
+    "FR": "France",
+    "DE": "Germany",
+    "ES": "Spain",
+    "IT": "Italy",
+    "NL": "Netherlands",
+    "BE": "Belgium",
+    "DK": "Denmark",
+    "SE": "Sweden",
+    "NO": "Norway",
+    "FI": "Finland",
+    "PL": "Poland",
+    "AU": "Australia",
+    "NZ": "New Zealand",
+    "CA": "Canada",
+    "JP": "Japan",
+}
+
+
+# ---------- time helpers ----------
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _now_iso() -> str:
+    return _now_utc().isoformat()
+
+
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+# ---------- watermark ----------
+
+
+def _read_watermark() -> datetime:
+    raw = db.get_watermark(WATERMARK_KEY)
+    parsed = _parse_iso(raw) if raw else None
+    if parsed:
+        return parsed
+    return _now_utc() - timedelta(days=DEFAULT_LOOKBACK_DAYS)
+
+
+def _save_watermark(ts: datetime) -> None:
+    db.set_watermark(WATERMARK_KEY, ts.isoformat())
+
+
+# ---------- sku map ----------
+
+
+def _load_sku_map() -> dict[str, str]:
+    """Returns variation_id → sku for everything in sq_sku_map.
+    Pre-loaded once per run; cheaper than per-order queries.
+    """
+    sku_map: dict[str, str] = {}
+    offset = 0
+    while True:
+        resp = (
+            db.client()
+            .table("sq_sku_map")
+            .select("sku, square_variation_id")
+            .range(offset, offset + SKU_MAP_PAGE_SIZE - 1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            break
+        for r in rows:
+            vid = r.get("square_variation_id")
+            sku = r.get("sku")
+            if vid and sku:
+                sku_map[vid] = sku
+        if len(rows) < SKU_MAP_PAGE_SIZE:
+            break
+        offset += SKU_MAP_PAGE_SIZE
+    return sku_map
+
+
+# ---------- Square pull ----------
+
+
+def _search_orders_page(start_at: str, cursor: Optional[str]) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "location_ids": [SHOP_LOCATION_ID],
+        "query": {
+            "filter": {
+                "date_time_filter": {
+                    "updated_at": {
+                        "start_at": start_at,
+                    },
+                },
+                "state_filter": {
+                    "states": ["COMPLETED"],
+                },
+            },
+            "sort": {
+                "sort_field": "UPDATED_AT",
+                "sort_order": "ASC",
+            },
+        },
+        "limit": ORDER_PAGE_LIMIT,
+    }
+    if cursor:
+        body["cursor"] = cursor
+    return square.call("orders/search", method="POST", json_body=body) or {}
+
+
+def _walk_orders(start_at: str) -> list[dict[str, Any]]:
+    print(f"\n--- pulling Square orders updated_at >= {start_at} ---")
+    orders: list[dict[str, Any]] = []
+    cursor: Optional[str] = None
+    pages = 0
+    while True:
+        pages += 1
+        resp = _search_orders_page(start_at, cursor)
+        page = resp.get("orders") or []
+        orders.extend(page)
+        print(f"    page {pages}: +{len(page)} order(s) (running total {len(orders)})")
+        cursor = resp.get("cursor")
+        if not cursor:
+            break
+    return orders
+
+
+# ---------- idempotency filter ----------
+
+
+def _filter_already_processed(
+    orders: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Returns (new_orders, already_processed_orders)."""
+    if not orders:
+        return ([], [])
+    ids = [o.get("id") for o in orders if o.get("id")]
+    already: set[str] = set()
+    for i in range(0, len(ids), PROCESSED_LOOKUP_CHUNK):
+        chunk = ids[i:i + PROCESSED_LOOKUP_CHUNK]
+        try:
+            resp = (
+                db.client()
+                .table("sq_square_orders_processed")
+                .select("square_order_id")
+                .in_("square_order_id", chunk)
+                .execute()
+            )
+            for r in resp.data or []:
+                if r.get("square_order_id"):
+                    already.add(r["square_order_id"])
+        except Exception as e:
+            sys.stderr.write(
+                f"[idempotency lookup FAILED chunk {i // PROCESSED_LOOKUP_CHUNK + 1}] {e}\n"
+            )
+    new = [o for o in orders if o.get("id") not in already]
+    skipped = [o for o in orders if o.get("id") in already]
+    return (new, skipped)
+
+
+# ---------- Linnworks payload construction ----------
+
+
+def _extract_recipient(order: dict[str, Any]) -> Optional[dict[str, Any]]:
+    fulfillments = order.get("fulfillments") or []
+    if not fulfillments:
+        return None
+    f0 = fulfillments[0] or {}
+    ship = (f0.get("shipment_details") or {}).get("recipient")
+    if ship:
+        return ship
+    pickup = (f0.get("pickup_details") or {}).get("recipient")
+    if pickup:
+        return pickup
+    return None
+
+
+def _country_full(code: Optional[str]) -> Optional[str]:
+    if not code:
+        return None
+    return COUNTRY_NAME.get(code.upper(), code)
+
+
+def _build_address(order: dict[str, Any]) -> dict[str, str]:
+    rec = _extract_recipient(order) or {}
+    addr = rec.get("address") or {}
+    return {
+        "FullName":     rec.get("display_name")  or PLACEHOLDER_ADDRESS["FullName"],
+        "Company":      "",
+        "EmailAddress": (
+            rec.get("email_address")
+            or order.get("buyer_email_address")
+            or PLACEHOLDER_ADDRESS["EmailAddress"]
+        ),
+        "PhoneNumber":  rec.get("phone_number")  or PLACEHOLDER_ADDRESS["PhoneNumber"],
+        "Address1":     addr.get("address_line_1") or PLACEHOLDER_ADDRESS["Address1"],
+        "Address2":     addr.get("address_line_2") or PLACEHOLDER_ADDRESS["Address2"],
+        "Address3":     "",
+        "Town":         addr.get("locality")       or PLACEHOLDER_ADDRESS["Town"],
+        "Region":       addr.get("administrative_district_level_1") or PLACEHOLDER_ADDRESS["Region"],
+        "PostCode":     addr.get("postal_code")    or PLACEHOLDER_ADDRESS["PostCode"],
+        "Country":      _country_full(addr.get("country")) or PLACEHOLDER_ADDRESS["Country"],
+        "CountryCode":  (addr.get("country") or PLACEHOLDER_ADDRESS["CountryCode"]).upper(),
+    }
+
+
+def _build_order_items(
+    order: dict[str, Any],
+    sku_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for li in order.get("line_items") or []:
+        cat_id = li.get("catalog_object_id") or ""
+        sku = sku_map.get(cat_id) if cat_id else None
+        if not sku:
+            # Service or ad-hoc line — fall back to the line name so
+            # Linnworks still records something sensible (and won't
+            # decrement stock since it's an unknown SKU).
+            sku = (li.get("name") or "").strip() or "UNKNOWN"
+        sku = sku.strip()
+
+        try:
+            qty = int(li.get("quantity") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        if qty < 1:
+            qty = 1
+
+        total_pence = 0
+        try:
+            total_pence = int((li.get("total_money") or {}).get("amount") or 0)
+        except (TypeError, ValueError):
+            pass
+        price_per_unit = round((total_pence / 100) / qty, 4)
+
+        items.append({
+            "SKU":          sku,
+            "ChannelSKU":   sku,
+            "ItemNumber":   sku,
+            "ItemTitle":    (li.get("name") or "").strip() or "Item",
+            "Qty":          qty,
+            "PricePerUnit": price_per_unit,
+            "Discount":     0,
+            "LineDiscount": 0,
+            "TaxRate":      0,
+        })
+    return items
+
+
+def _build_linnworks_payload(
+    order: dict[str, Any],
+    sku_map: dict[str, str],
+) -> dict[str, Any]:
+    sq_id = order["id"]
+    received = _parse_iso(order.get("created_at")) or _now_utc()
+    dispatch_by = received + timedelta(days=2)
+    address = _build_address(order)
+
+    return {
+        "Source":                  "SQUAREPOS",
+        "SubSource":               f"# {sq_id}",
+        "ReferenceNumber":         sq_id,
+        "ExternalReferenceNumber": sq_id,
+        "ReceivedDate":            received.isoformat(),
+        "DispatchBy":              dispatch_by.isoformat(),
+        "LocationId":              LINNWORKS_DEFAULT_LOCATION,
+        "Currency":                "GBP",
+        "OrderItems":              _build_order_items(order, sku_map),
+        "DeliveryAddress":         address,
+        "BillingAddress":          dict(address),
+    }
+
+
+# ---------- Linnworks call ----------
+
+
+def _create_linnworks_order(payload: dict[str, Any]) -> str:
+    """POST Orders/CreateOrders for one order. Returns the pkOrderID
+    string. Per DISCOVERIES.md §3, the response is a bare JSON array
+    of pkOrderID strings.
+    """
+    body = {"orders": [payload]}
+    resp = linnworks.call("Orders/CreateOrders", json_body=body)
+    if isinstance(resp, list) and resp and isinstance(resp[0], str):
+        return resp[0]
+    raise RuntimeError(f"unexpected CreateOrders response shape: {resp!r}")
+
+
+# ---------- bookkeeping helpers ----------
+
+
+def _record_processed(square_id: str, lw_pk: str, order: dict[str, Any]) -> None:
+    total_pence = 0
+    try:
+        total_pence = int((order.get("total_money") or {}).get("amount") or 0)
+    except (TypeError, ValueError):
+        pass
+    rec = _extract_recipient(order) or {}
+    customer_name = rec.get("display_name") or "Square Customer"
+    db.client().table("sq_square_orders_processed").insert({
+        "square_order_id":    square_id,
+        "linnworks_order_id": lw_pk,
+        "total":              f"{total_pence / 100:.2f}",
+        "customer_name":      customer_name,
+        "status":             "created",
+    }).execute()
+
+
+def _log_per_order_error(square_id: str, message: str, context: dict[str, Any]) -> None:
+    ctx = {"square_order_id": square_id}
+    ctx.update(context)
+    db.log_error(JOB_NAME, message, ctx)
+
+
+def _write_audit_row(
+    *,
+    mode: str,
+    watermark_before: Optional[datetime],
+    watermark_after: Optional[datetime],
+    orders_fetched: int,
+    orders_processed: int,
+    orders_skipped: int,
+    orders_failed: int,
+    error_messages: list[str],
+) -> None:
+    summary = ""
+    if error_messages:
+        summary = " | ".join(m[:100] for m in error_messages[:3])
+        if len(error_messages) > 3:
+            summary += f" | (+{len(error_messages) - 3} more)"
+    payload = {
+        "run_at":           _now_iso(),
+        "mode":             mode,
+        "watermark_before": watermark_before.isoformat() if watermark_before else None,
+        "watermark_after":  watermark_after.isoformat() if watermark_after else None,
+        "orders_fetched":   orders_fetched,
+        "orders_processed": orders_processed,
+        "orders_skipped":   orders_skipped,
+        "orders_failed":    orders_failed,
+        "error_summary":    summary[:1000] if summary else None,
+    }
+    try:
+        db.client().table("sq_orders_pull_log").insert(payload).execute()
+        print("    audit row written to sq_orders_pull_log")
+    except Exception as e:
+        sys.stderr.write(f"[sq_orders_pull_log insert FAILED] {e}\n")
+
+
+# ---------- preview ----------
+
+
+def _print_payload_preview(order: dict[str, Any], payload: dict[str, Any]) -> None:
+    sq_id = order.get("id")
+    sq_total = ((order.get("total_money") or {}).get("amount") or 0) / 100
+    print(f"\n  ━━━ {sq_id} (total £{sq_total:.2f}, {len(payload['OrderItems'])} line(s)) ━━━")
+    print(json.dumps(payload, indent=2, default=str))
+
+
+# ---------- main ----------
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="pull_square_orders_to_linnworks",
+        description=(
+            "Pulls COMPLETED Square POS orders updated since the "
+            "watermark and creates matching orders in Linnworks. "
+            "Default mode is OBSERVE (dry run, prints planned "
+            "payloads). Pass --write to actually call CreateOrders "
+            "and advance the watermark."
+        ),
+    )
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Actually POST to Linnworks. Without this, observe-only.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Cap on orders to process this run. Useful for staged rollouts.",
+    )
+    args = parser.parse_args(argv)
+
+    mode = "write" if args.write else "observe"
+    print(
+        f"\n{'!' * 70}\n"
+        f"!!  pull_square_orders_to_linnworks — mode={mode.upper()}\n"
+        f"!!  {'will WRITE Linnworks orders + advance watermark' if args.write else 'DRY RUN — no Linnworks writes, watermark frozen'}\n"
+        f"{'!' * 70}\n"
+    )
+
+    # ---------- preload ----------
+    print("--- loading sq_sku_map ---")
+    sku_map = _load_sku_map()
+    print(f"    {len(sku_map)} variation_id → sku mapping(s) loaded")
+
+    watermark_before = _read_watermark()
+    window_start_dt = watermark_before - timedelta(seconds=WATERMARK_BACKSTEP_SECONDS)
+    window_start = window_start_dt.isoformat()
+    print(f"\nwatermark (sq_watermarks[{WATERMARK_KEY!r}]): {watermark_before.isoformat()}")
+    print(f"pull window: updated_at >= {window_start} (back-stepped {WATERMARK_BACKSTEP_SECONDS}s)")
+
+    # ---------- pull ----------
+    orders = _walk_orders(window_start)
+    fetched = len(orders)
+    if args.limit is not None:
+        if args.limit < 0:
+            print(f"ERROR: --limit must be non-negative, got {args.limit}")
+            return 2
+        if args.limit < len(orders):
+            print(f"\n--- --limit {args.limit} applied: trimming from {len(orders)} → {args.limit} ---")
+            orders = orders[:args.limit]
+
+    # ---------- idempotency ----------
+    new_orders, skipped_orders = _filter_already_processed(orders)
+    print(
+        f"\n=== fetched={fetched}  to_process={len(new_orders)}  "
+        f"already_processed={len(skipped_orders)} ==="
+    )
+
+    # ---------- PLAN ----------
+    print("\n" + "=" * 70)
+    print("=== PLAN ===")
+    print("=" * 70)
+    print(f"Will attempt to create {len(new_orders)} Linnworks order(s).")
+    if new_orders:
+        n_show = min(PLAN_PREVIEW, len(new_orders))
+        print(f"\n--- previewing first {n_show} payload(s) ---")
+        for o in new_orders[:PLAN_PREVIEW]:
+            try:
+                payload = _build_linnworks_payload(o, sku_map)
+                _print_payload_preview(o, payload)
+            except Exception as e:
+                print(f"  ! could not build payload for {o.get('id')!r}: {e}")
+
+    # ---------- observe → exit ----------
+    if not args.write:
+        print(f"\n=== DRY RUN — no Linnworks writes performed, watermark unchanged. ===")
+        _write_audit_row(
+            mode=mode,
+            watermark_before=watermark_before,
+            watermark_after=None,
+            orders_fetched=fetched,
+            orders_processed=0,
+            orders_skipped=len(skipped_orders),
+            orders_failed=0,
+            error_messages=[],
+        )
+        print(
+            f"\n=== PULL COMPLETE: fetched={fetched} processed=0 "
+            f"skipped={len(skipped_orders)} failed=0 "
+            f"watermark_before={watermark_before.isoformat()} watermark_after=(unchanged) "
+            f"(observe mode) ==="
+        )
+        return 0
+
+    # ---------- write ----------
+    print(
+        f"\n=== WRITE MODE — about to call Linnworks Orders/CreateOrders for "
+        f"{len(new_orders)} order(s) ==="
+    )
+
+    successful: list[tuple[dict[str, Any], str]] = []
+    failed: list[tuple[dict[str, Any], str]] = []
+    error_messages: list[str] = []
+
+    for order in new_orders:
+        sq_id = order.get("id") or "(no id)"
+        try:
+            payload = _build_linnworks_payload(order, sku_map)
+        except Exception as e:
+            msg = f"payload build failed: {e}"
+            _log_per_order_error(sq_id, msg, {"step": "build"})
+            error_messages.append(f"{sq_id}: {msg}")
+            failed.append((order, msg))
+            print(f"  ✗ {sq_id} → {msg[:200]}")
+            continue
+
+        try:
+            pk = _create_linnworks_order(payload)
+        except Exception as e:
+            msg = f"CreateOrders failed: {e}"
+            _log_per_order_error(sq_id, msg, {"step": "create"})
+            error_messages.append(f"{sq_id}: {msg}")
+            failed.append((order, msg))
+            print(f"  ✗ {sq_id} → {msg[:200]}")
+            continue
+
+        try:
+            _record_processed(sq_id, pk, order)
+        except Exception as e:
+            # Linnworks order created but bookkeeping failed — log
+            # loudly and treat as success for counters; the natural
+            # dedup on (Source, SubSource, ReferenceNumber) protects
+            # us from double-creation if this row never lands.
+            sys.stderr.write(
+                f"[sq_square_orders_processed insert FAILED for {sq_id} → {pk}] {e}\n"
+            )
+            error_messages.append(f"{sq_id}: bookkeeping insert failed: {e}")
+
+        successful.append((order, pk))
+        print(f"  ✓ {sq_id} → pkOrderID {pk}")
+
+    # ---------- watermark ----------
+    watermark_after: Optional[datetime] = None
+    if successful:
+        candidates = [
+            _parse_iso(o.get("updated_at"))
+            for o, _ in successful
+        ]
+        candidates = [c for c in candidates if c is not None]
+        if candidates:
+            watermark_after = max(candidates)
+            try:
+                _save_watermark(watermark_after)
+                print(f"\nwatermark advanced: {watermark_before.isoformat()} → {watermark_after.isoformat()}")
+            except Exception as e:
+                sys.stderr.write(f"[watermark save FAILED] {e}\n")
+                error_messages.append(f"watermark save failed: {e}")
+                watermark_after = None
+
+    # ---------- audit + summary ----------
+    _write_audit_row(
+        mode=mode,
+        watermark_before=watermark_before,
+        watermark_after=watermark_after,
+        orders_fetched=fetched,
+        orders_processed=len(successful),
+        orders_skipped=len(skipped_orders),
+        orders_failed=len(failed),
+        error_messages=error_messages,
+    )
+
+    print("\n" + "=" * 70)
+    print(
+        f"=== PULL COMPLETE: fetched={fetched} processed={len(successful)} "
+        f"skipped={len(skipped_orders)} failed={len(failed)} "
+        f"watermark_before={watermark_before.isoformat()} "
+        f"watermark_after={watermark_after.isoformat() if watermark_after else '(unchanged)'} ==="
+    )
+    print("=" * 70)
+
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
