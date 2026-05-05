@@ -330,6 +330,8 @@ def _build_address(order: dict[str, Any]) -> dict[str, str]:
 def _build_order_items(
     order: dict[str, Any],
     sku_map: dict[str, str],
+    *,
+    verbose: bool = False,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for li in order.get("line_items") or []:
@@ -339,7 +341,19 @@ def _build_order_items(
             # Service or ad-hoc line — fall back to the line name so
             # Linnworks still records something sensible (and won't
             # decrement stock since it's an unknown SKU).
-            sku = (li.get("name") or "").strip() or "UNKNOWN"
+            title = (li.get("name") or "").strip()
+            if verbose:
+                # Diagnostic for the observe-mode preview. If a
+                # catalog_object_id is present but missing from
+                # sq_sku_map, eyeball the printed id against the
+                # table — most-likely culprit when retail items go
+                # to fallback is an ID type mismatch (item id vs
+                # variation id).
+                print(
+                    f"    [SKU lookup miss] catalog_object_id={cat_id!r} "
+                    f"falling back to title={title!r}"
+                )
+            sku = title or "UNKNOWN"
         sku = sku.strip()
 
         try:
@@ -373,6 +387,8 @@ def _build_order_items(
 def _build_linnworks_payload(
     order: dict[str, Any],
     sku_map: dict[str, str],
+    *,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     sq_id = order["id"]
     received = _parse_iso(order.get("created_at")) or _now_utc()
@@ -388,7 +404,7 @@ def _build_linnworks_payload(
         "DispatchBy":              dispatch_by.isoformat(),
         "LocationId":              LINNWORKS_DEFAULT_LOCATION,
         "Currency":                "GBP",
-        "OrderItems":              _build_order_items(order, sku_map),
+        "OrderItems":              _build_order_items(order, sku_map, verbose=verbose),
         "DeliveryAddress":         address,
         "BillingAddress":          dict(address),
     }
@@ -463,6 +479,7 @@ def _write_audit_row(
     orders_fetched: int,
     orders_processed: int,
     orders_skipped: int,
+    orders_skipped_empty: int,
     orders_failed: int,
     orders_created: int,
     orders_unparked: int,
@@ -475,18 +492,19 @@ def _write_audit_row(
         if len(error_messages) > 3:
             summary += f" | (+{len(error_messages) - 3} more)"
     payload = {
-        "run_at":             _now_iso(),
-        "mode":               mode,
-        "watermark_before":   watermark_before.isoformat() if watermark_before else None,
-        "watermark_after":    watermark_after.isoformat() if watermark_after else None,
-        "orders_fetched":     orders_fetched,
-        "orders_processed":   orders_processed,
-        "orders_skipped":     orders_skipped,
-        "orders_failed":      orders_failed,
-        "orders_created":     orders_created,
-        "orders_unparked":    orders_unparked,
-        "orders_marked_paid": orders_marked_paid,
-        "error_summary":      summary[:1000] if summary else None,
+        "run_at":               _now_iso(),
+        "mode":                 mode,
+        "watermark_before":     watermark_before.isoformat() if watermark_before else None,
+        "watermark_after":      watermark_after.isoformat() if watermark_after else None,
+        "orders_fetched":       orders_fetched,
+        "orders_processed":     orders_processed,
+        "orders_skipped":       orders_skipped,
+        "orders_skipped_empty": orders_skipped_empty,
+        "orders_failed":        orders_failed,
+        "orders_created":       orders_created,
+        "orders_unparked":      orders_unparked,
+        "orders_marked_paid":   orders_marked_paid,
+        "error_summary":        summary[:1000] if summary else None,
     }
     try:
         db.client().table("sq_orders_pull_log").insert(payload).execute()
@@ -550,6 +568,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("--- loading sq_sku_map ---")
     sku_map = _load_sku_map()
     print(f"    {len(sku_map)} variation_id → sku mapping(s) loaded")
+    if sku_map:
+        # Sanity check: keys should look like Square variation IDs
+        # (uppercase alphanum, ~26 chars). If they look wrong here,
+        # the bug is in _load_sku_map.
+        sample_key = next(iter(sku_map))
+        print(f"    sample mapping: {sample_key!r} → {sku_map[sample_key]!r}")
 
     watermark_before = _read_watermark()
     window_start_dt = watermark_before - timedelta(seconds=WATERMARK_BACKSTEP_SECONDS)
@@ -570,10 +594,25 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ---------- idempotency ----------
     new_orders, skipped_orders = _filter_already_processed(orders)
+
+    # Filter out orders Square returned with zero line items —
+    # creating empty orders in Linnworks isn't useful. Don't insert
+    # into sq_square_orders_processed (so if Square later attaches
+    # line items, we'll re-evaluate); don't log to sq_errors (it's
+    # not a failure, just empty). Surface the count in SUMMARY +
+    # audit row.
+    empty_orders = [o for o in new_orders if not (o.get("line_items") or [])]
+    new_orders = [o for o in new_orders if (o.get("line_items") or [])]
+    skipped_empty_count = len(empty_orders)
+
     print(
         f"\n=== fetched={fetched}  to_process={len(new_orders)}  "
-        f"already_processed={len(skipped_orders)} ==="
+        f"already_processed={len(skipped_orders)}  "
+        f"skipped_empty={skipped_empty_count} ==="
     )
+    if empty_orders:
+        for o in empty_orders[:PLAN_PREVIEW]:
+            print(f"  empty order skipped: {o.get('id')!r}")
 
     # ---------- PLAN ----------
     print("\n" + "=" * 70)
@@ -585,7 +624,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"\n--- previewing first {n_show} payload(s) ---")
         for o in new_orders[:PLAN_PREVIEW]:
             try:
-                payload = _build_linnworks_payload(o, sku_map)
+                payload = _build_linnworks_payload(o, sku_map, verbose=True)
                 _print_payload_preview(o, payload)
             except Exception as e:
                 print(f"  ! could not build payload for {o.get('id')!r}: {e}")
@@ -600,6 +639,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             orders_fetched=fetched,
             orders_processed=0,
             orders_skipped=len(skipped_orders),
+            orders_skipped_empty=skipped_empty_count,
             orders_failed=0,
             orders_created=0,
             orders_unparked=0,
@@ -608,7 +648,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         print(
             f"\n=== PULL COMPLETE: fetched={fetched} processed=0 "
-            f"skipped={len(skipped_orders)} failed=0 "
+            f"skipped={len(skipped_orders)} skipped_empty={skipped_empty_count} failed=0 "
             f"created=0 unparked=0 marked_paid=0 "
             f"watermark_before={watermark_before.isoformat()} watermark_after=(unchanged) "
             f"(observe mode) ==="
@@ -731,6 +771,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         orders_fetched=fetched,
         orders_processed=len(successful),
         orders_skipped=len(skipped_orders),
+        orders_skipped_empty=skipped_empty_count,
         orders_failed=len(failed),
         orders_created=created_count,
         orders_unparked=unparked_count,
@@ -741,7 +782,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("\n" + "=" * 70)
     print(
         f"=== PULL COMPLETE: fetched={fetched} processed={len(successful)} "
-        f"skipped={len(skipped_orders)} failed={len(failed)} "
+        f"skipped={len(skipped_orders)} skipped_empty={skipped_empty_count} failed={len(failed)} "
         f"created={created_count} unparked={unparked_count} marked_paid={marked_paid_count} "
         f"watermark_before={watermark_before.isoformat()} "
         f"watermark_after={watermark_after.isoformat() if watermark_after else '(unchanged)'} ==="
