@@ -71,6 +71,7 @@ SQUARE_PAGE_LIMIT = 100
 INVENTORY_FETCH_CHUNK = 500
 UPSERT_BATCH_SIZE = 100
 STOCK_BATCH_SIZE = 100
+SKU_MAP_BATCH_SIZE = 500
 SLEEP_BETWEEN_BATCHES = 0.2
 
 PREVIEW_PER_CATEGORY = 20
@@ -218,6 +219,10 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
 
             barcode = (it.get("BarcodeNumber") or "").strip() or None
             qty = _extract_default_qty(it.get("StockLevels") or [])
+            # Linnworks StockItemId — feeds sq_sku_map.linnworks_item_id
+            # (uuid column). Trusted as-is; if missing, store None
+            # rather than fabricating a value.
+            lw_item_id = (it.get("StockItemId") or "").strip() or None
 
             items.append({
                 "sku": sku,
@@ -225,6 +230,7 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
                 "price_pence": price_pence,
                 "barcode": barcode,
                 "qty": qty,
+                "linnworks_item_id": lw_item_id,
             })
 
         prev_page_count = len(page_items)
@@ -518,17 +524,21 @@ def _do_upsert_batch(
 
 def _do_creates(
     creates: list[dict[str, Any]],
-) -> tuple[dict[str, str], int, list[str]]:
-    """Returns (sku_to_new_variation_id, fail_count, errors).
+) -> tuple[dict[str, dict[str, str]], int, list[str]]:
+    """Returns (sku_to_new_ids, fail_count, errors) where
+    sku_to_new_ids[sku] = {"item_id": <real Square ITEM id>,
+                           "variation_id": <real ITEM_VARIATION id>}
+    for each successfully created SKU.
 
     Failures are at the batch granularity — if a batch errors, all
-    items in the batch are counted as failed and they don't get a
-    variation_id (so we can't push stock for them).
+    items in the batch are counted as failed and they don't get any
+    real IDs (so we can't push stock or write a sq_sku_map row for
+    them).
     """
     if not creates:
         return ({}, 0, [])
 
-    sku_to_var_id: dict[str, str] = {}
+    sku_to_new_ids: dict[str, dict[str, str]] = {}
     fail_count = 0
     errors: list[str] = []
 
@@ -544,29 +554,38 @@ def _do_creates(
             errors.extend(batch_errors)
             print(f"    batch {i}/{n_batches}: FAIL — {batch_errors[0][:200]}")
             continue
-        # Map temp #var_<sku> → real variation id
+        # Map temp #temp_<sku>/#var_<sku> → real item/variation ids.
+        # Both must resolve for the SKU to count as fully created.
         resolved = 0
         for it in chunk:
-            real = id_map.get(_temp_var_id(it["sku"]))
-            if real:
-                sku_to_var_id[it["sku"]] = real
+            item_real = id_map.get(_temp_item_id(it["sku"]))
+            var_real = id_map.get(_temp_var_id(it["sku"]))
+            if item_real and var_real:
+                sku_to_new_ids[it["sku"]] = {
+                    "item_id": item_real,
+                    "variation_id": var_real,
+                }
                 resolved += 1
         unresolved = len(chunk) - resolved
         if unresolved:
             fail_count += unresolved
             errors.append(
-                f"CREATE batch {i}: {unresolved} item(s) returned no id_mapping for variation"
+                f"CREATE batch {i}: {unresolved} item(s) returned no id_mapping for item+variation"
             )
-        print(f"    batch {i}/{n_batches}: OK — {resolved} variation id(s) resolved, {unresolved} unresolved")
+        print(f"    batch {i}/{n_batches}: OK — {resolved} id pair(s) resolved, {unresolved} unresolved")
 
-    return (sku_to_var_id, fail_count, errors)
+    return (sku_to_new_ids, fail_count, errors)
 
 
-def _do_updates(updates: list[dict[str, Any]]) -> tuple[int, list[str]]:
+def _do_updates(updates: list[dict[str, Any]]) -> tuple[set[str], int, list[str]]:
+    """Returns (failed_skus, fail_count, errors). fail_count is just
+    len(failed_skus) — kept as a separate return for symmetry with the
+    other write helpers and to avoid double-computing at call sites.
+    """
     if not updates:
-        return (0, [])
+        return (set(), 0, [])
 
-    fail_count = 0
+    failed_skus: set[str] = set()
     errors: list[str] = []
 
     n_batches = (len(updates) + UPSERT_BATCH_SIZE - 1) // UPSERT_BATCH_SIZE
@@ -577,24 +596,28 @@ def _do_updates(updates: list[dict[str, Any]]) -> tuple[int, list[str]]:
         objects = [_build_update_object(it) for it in chunk]
         _, batch_errors = _do_upsert_batch(objects, label=f"UPDATE batch {i}/{n_batches}")
         if batch_errors:
-            fail_count += len(chunk)
+            for it in chunk:
+                failed_skus.add(it["sku"])
             errors.extend(batch_errors)
             print(f"    batch {i}/{n_batches}: FAIL — {batch_errors[0][:200]}")
         else:
             print(f"    batch {i}/{n_batches}: OK — {len(chunk)} item(s) updated")
-    return (fail_count, errors)
+    return (failed_skus, len(failed_skus), errors)
 
 
 def _do_stock_push(
     stock_changes: list[dict[str, Any]],
-) -> tuple[int, list[str]]:
-    """stock_changes is a list of {variation_id, qty}. Sends in chunks
-    via /inventory/changes/batch-create. Returns (fail_count, errors).
+) -> tuple[set[str], int, list[str]]:
+    """stock_changes is a list of {variation_id, qty, sku}. Sends in
+    chunks via /inventory/changes/batch-create. Returns
+    (failed_skus, fail_count, errors). The SKU on each change is used
+    only to attribute per-batch failures back to specific SKUs (so we
+    know which sq_sku_map rows are at risk); it isn't sent to Square.
     """
     if not stock_changes:
-        return (0, [])
+        return (set(), 0, [])
 
-    fail_count = 0
+    failed_skus: set[str] = set()
     errors: list[str] = []
     occurred_at = datetime.now(timezone.utc).isoformat()
 
@@ -623,10 +646,12 @@ def _do_stock_push(
             square.call("inventory/changes/batch-create", method="POST", json_body=body)
             print(f"    batch {i}/{n_batches}: OK — {len(chunk)} change(s)")
         except square.SquareError as e:
-            fail_count += len(chunk)
+            for c in chunk:
+                if c.get("sku"):
+                    failed_skus.add(c["sku"])
             errors.append(f"STOCK batch {i}: {str(e)[:300]}")
             print(f"    batch {i}/{n_batches}: FAIL — {str(e)[:200]}")
-    return (fail_count, errors)
+    return (failed_skus, len(failed_skus), errors)
 
 
 # ---------- audit ----------
@@ -673,6 +698,144 @@ def _write_audit_row(
         print("    audit row written to sq_lw_sync_log")
     except Exception as e:
         sys.stderr.write(f"[sq_lw_sync_log insert FAILED] {e}\n")
+
+
+# ---------- sq_sku_map population ----------
+
+
+def _sku_map_row(
+    *,
+    sku: str,
+    linnworks_item_id: Optional[str],
+    square_catalog_id: Optional[str],
+    square_variation_id: Optional[str],
+    qty: int,
+    price_pence: int,
+    now: str,
+) -> dict[str, Any]:
+    return {
+        "sku": sku,
+        "linnworks_item_id": linnworks_item_id,
+        "square_catalog_id": square_catalog_id,
+        "square_variation_id": square_variation_id,
+        "last_known_stock": int(qty or 0),
+        # numeric column — pass as a 2dp string so the wire format
+        # is unambiguous. price_pence/100 in float can round-trip
+        # to e.g. 12.989999... .
+        "last_known_price": f"{(price_pence or 0) / 100:.2f}",
+        "last_pushed_at": now,
+        "active": True,
+    }
+
+
+def _build_sku_map_rows(
+    *,
+    creates: list[dict[str, Any]],
+    sku_to_new_ids: dict[str, dict[str, str]],
+    updates: list[dict[str, Any]],
+    failed_update_skus: set[str],
+    stock_only: list[dict[str, Any]],
+    failed_stock_skus: set[str],
+    no_op: list[dict[str, Any]],
+    square_map: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build sq_sku_map upsert rows.
+
+    Inclusion rules per category:
+      - CREATE: catalog upsert succeeded (sku in sku_to_new_ids).
+        If the follow-on stock push for this SKU failed, we still
+        record the catalog mapping — the next run will see a
+        STOCK_ONLY discrepancy and reconcile last_known_stock.
+      - UPDATE: catalog upsert succeeded (sku not in
+        failed_update_skus).
+      - STOCK_ONLY: stock push succeeded (sku not in
+        failed_stock_skus). The only operation in this category IS
+        the stock push, so failure means there's nothing to record.
+      - NO_OP: always — these are the backfill rows for SKUs that
+        already match Square and otherwise wouldn't get written.
+    """
+    now = _now_iso()
+    rows: list[dict[str, Any]] = []
+
+    for it in creates:
+        ids = sku_to_new_ids.get(it["sku"])
+        if not ids:
+            continue
+        rows.append(_sku_map_row(
+            sku=it["sku"],
+            linnworks_item_id=it.get("linnworks_item_id"),
+            square_catalog_id=ids.get("item_id"),
+            square_variation_id=ids.get("variation_id"),
+            qty=it["qty"],
+            price_pence=it["price_pence"],
+            now=now,
+        ))
+
+    for it in updates:
+        if it["sku"] in failed_update_skus:
+            continue
+        existing = it.get("_existing") or {}
+        rows.append(_sku_map_row(
+            sku=it["sku"],
+            linnworks_item_id=it.get("linnworks_item_id"),
+            square_catalog_id=existing.get("item_id"),
+            square_variation_id=existing.get("variation_id"),
+            qty=it["qty"],
+            price_pence=it["price_pence"],
+            now=now,
+        ))
+
+    for it in stock_only:
+        if it["sku"] in failed_stock_skus:
+            continue
+        existing = it.get("_existing") or {}
+        rows.append(_sku_map_row(
+            sku=it["sku"],
+            linnworks_item_id=it.get("linnworks_item_id"),
+            square_catalog_id=existing.get("item_id"),
+            square_variation_id=existing.get("variation_id"),
+            qty=it["qty"],
+            price_pence=it["price_pence"],
+            now=now,
+        ))
+
+    for it in no_op:
+        existing = square_map.get(it["sku"]) or {}
+        rows.append(_sku_map_row(
+            sku=it["sku"],
+            linnworks_item_id=it.get("linnworks_item_id"),
+            square_catalog_id=existing.get("item_id"),
+            square_variation_id=existing.get("variation_id"),
+            qty=it["qty"],
+            price_pence=it["price_pence"],
+            now=now,
+        ))
+
+    return rows
+
+
+def _upsert_sku_map(rows: list[dict[str, Any]]) -> int:
+    """Batch-upsert into sq_sku_map keyed on sku. Returns the count
+    of rows successfully written. Per-batch failures are logged to
+    stderr and don't crash the run — sq_sku_map is observability for
+    the cron, not the source of truth.
+    """
+    if not rows:
+        return 0
+    written = 0
+    n_batches = (len(rows) + SKU_MAP_BATCH_SIZE - 1) // SKU_MAP_BATCH_SIZE
+    print(f"\n--- sq_sku_map upsert: {len(rows)} row(s) in {n_batches} batch(es) ---")
+    for i, chunk in enumerate(_chunks(rows, SKU_MAP_BATCH_SIZE), start=1):
+        try:
+            db.client().table("sq_sku_map").upsert(chunk, on_conflict="sku").execute()
+            written += len(chunk)
+            print(f"    batch {i}/{n_batches}: OK — {len(chunk)} row(s) upserted")
+        except Exception as e:
+            sys.stderr.write(
+                f"[sq_sku_map upsert FAILED batch {i}/{n_batches}] {e}\n"
+            )
+            print(f"    batch {i}/{n_batches}: FAIL — {str(e)[:200]}")
+    return written
 
 
 # ---------- preview ----------
@@ -799,7 +962,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"\n=== SYNC COMPLETE: created={created_count} "
             f"updated={updated_count} stock_only={stock_only_count} "
             f"no_op={no_op_count} failed=0 duplicate_skus={duplicate_skus} "
-            f"(observe mode) ==="
+            f"sku_map_upserted=0 (observe mode) ==="
         )
         return 0
 
@@ -809,29 +972,44 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"({created_count} create, {updated_count} update, {stock_only_count} stock-only) ==="
     )
 
-    sku_to_new_var_id, create_fail, create_errors = _do_creates(creates)
-    update_fail, update_errors = _do_updates(updates)
+    sku_to_new_ids, create_fail, create_errors = _do_creates(creates)
+    failed_update_skus, update_fail, update_errors = _do_updates(updates)
 
     # Build stock changes: CREATE (with new var ids), UPDATE (existing
-    # var ids), STOCK_ONLY (existing var ids).
+    # var ids), STOCK_ONLY (existing var ids). Each carries its sku
+    # so _do_stock_push can attribute per-batch failures back to
+    # specific SKUs for the sq_sku_map upsert.
     stock_changes: list[dict[str, Any]] = []
     for it in creates:
-        var_id = sku_to_new_var_id.get(it["sku"])
+        var_id = (sku_to_new_ids.get(it["sku"]) or {}).get("variation_id")
         if var_id:
-            stock_changes.append({"variation_id": var_id, "qty": it["qty"]})
+            stock_changes.append({"variation_id": var_id, "qty": it["qty"], "sku": it["sku"]})
     for it in updates:
         var_id = (it.get("_existing") or {}).get("variation_id")
         if var_id:
-            stock_changes.append({"variation_id": var_id, "qty": it["qty"]})
+            stock_changes.append({"variation_id": var_id, "qty": it["qty"], "sku": it["sku"]})
     for it in stock_only:
         var_id = (it.get("_existing") or {}).get("variation_id")
         if var_id:
-            stock_changes.append({"variation_id": var_id, "qty": it["qty"]})
+            stock_changes.append({"variation_id": var_id, "qty": it["qty"], "sku": it["sku"]})
 
-    stock_fail, stock_errors = _do_stock_push(stock_changes)
+    failed_stock_skus, stock_fail, stock_errors = _do_stock_push(stock_changes)
 
     total_failed = create_fail + update_fail + stock_fail
     all_errors = create_errors + update_errors + stock_errors
+
+    # ---------- sq_sku_map population ----------
+    sku_map_rows = _build_sku_map_rows(
+        creates=creates,
+        sku_to_new_ids=sku_to_new_ids,
+        updates=updates,
+        failed_update_skus=failed_update_skus,
+        stock_only=stock_only,
+        failed_stock_skus=failed_stock_skus,
+        no_op=no_op,
+        square_map=square_map,
+    )
+    sku_map_rows_upserted = _upsert_sku_map(sku_map_rows)
 
     _write_audit_row(
         mode=mode,
@@ -850,7 +1028,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(
         f"=== SYNC COMPLETE: created={created_count} updated={updated_count} "
         f"stock_only={stock_only_count} no_op={no_op_count} "
-        f"failed={total_failed} duplicate_skus={duplicate_skus} ==="
+        f"failed={total_failed} duplicate_skus={duplicate_skus} "
+        f"sku_map_upserted={sku_map_rows_upserted} ==="
     )
     print("=" * 70)
 
