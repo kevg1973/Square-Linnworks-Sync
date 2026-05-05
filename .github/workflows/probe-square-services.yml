@@ -1,0 +1,38 @@
+name: Probe — Square services list
+
+# Manual trigger only. Read-only — walks the Square catalog and
+# prints every APPOINTMENTS_SERVICE item with the details needed
+# to map services back to Linnworks SKUs. No writes, no
+# mutations.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      LINNWORKS_APP_ID:      ${{ secrets.LINNWORKS_APP_ID }}
+      LINNWORKS_APP_SECRET:  ${{ secrets.LINNWORKS_APP_SECRET }}
+      LINNWORKS_TOKEN:       ${{ secrets.LINNWORKS_TOKEN }}
+      SQUARE_ACCESS_TOKEN:   ${{ secrets.SQUARE_ACCESS_TOKEN }}
+      SQUARE_APPLICATION_ID: ${{ secrets.SQUARE_APPLICATION_ID }}
+      SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY:  ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probe
+        run: python -m probes.probe_square_services
