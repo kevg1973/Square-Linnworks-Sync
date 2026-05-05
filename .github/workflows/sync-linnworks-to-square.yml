@@ -1,10 +1,15 @@
 name: Sync — Linnworks → Square
 
-# Manual trigger only. Defaults to observe-mode (dry run); write
-# mode requires the operator to explicitly select it. Pulls the
-# full Linnworks catalog and reconciles against Square's REGULAR
-# items, then in write mode creates/updates and pushes stock.
+# Two triggers:
+#   - schedule: every 30 min, always --write, no limit (the cron sync).
+#   - workflow_dispatch: manual run with mode (observe/write) and
+#     optional limit; defaults to observe (the legacy behaviour, kept
+#     for ad-hoc dry runs and staged rollouts).
+# Concurrency group below ensures only one sync runs at a time so a
+# slow run can't overlap with the next cron tick.
 on:
+  schedule:
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -19,6 +24,10 @@ on:
         description: 'Optional cap on Linnworks items to process this run. Leave blank for no cap.'
         required: false
         type: string
+
+concurrency:
+  group: sync-linnworks-to-square
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -47,15 +56,28 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run sync (mode=${{ inputs.mode }}, limit=${{ inputs.limit }})
+      - name: Run sync (event=${{ github.event_name }})
         run: |
           set -e
-          args=""
-          if [ "${{ inputs.mode }}" = "write" ]; then
-            args="$args --write"
-          fi
-          if [ -n "${{ inputs.limit }}" ]; then
-            args="$args --limit ${{ inputs.limit }}"
-          fi
-          echo "Invoking: python -m tools.sync_linnworks_to_square $args"
+          case "${{ github.event_name }}" in
+            schedule)
+              # Cron tick — always write, never limited.
+              args="--write"
+              ;;
+            workflow_dispatch)
+              # Manual run — honour the inputs.
+              args=""
+              if [ "${{ inputs.mode }}" = "write" ]; then
+                args="$args --write"
+              fi
+              if [ -n "${{ inputs.limit }}" ]; then
+                args="$args --limit ${{ inputs.limit }}"
+              fi
+              ;;
+            *)
+              # Defensive — shouldn't happen given the on: triggers above.
+              args=""
+              ;;
+          esac
+          echo "Invoking (event=${{ github.event_name }}): python -m tools.sync_linnworks_to_square $args"
           python -m tools.sync_linnworks_to_square $args
