@@ -170,11 +170,23 @@ CREATE TABLE IF NOT EXISTS sq_orders_pull_log (
     watermark_before   TIMESTAMPTZ,
     watermark_after    TIMESTAMPTZ,
     orders_fetched     INTEGER NOT NULL DEFAULT 0,
-    orders_processed   INTEGER NOT NULL DEFAULT 0,
+    orders_processed   INTEGER NOT NULL DEFAULT 0,  -- all 3 Linnworks steps + bookkeeping landed
     orders_skipped     INTEGER NOT NULL DEFAULT 0,
-    orders_failed      INTEGER NOT NULL DEFAULT 0,
+    orders_failed      INTEGER NOT NULL DEFAULT 0,  -- one per order; any of the 3 Linnworks steps failed
+    orders_created     INTEGER NOT NULL DEFAULT 0,  -- step 1 (CreateOrders) succeeded
+    orders_unparked    INTEGER NOT NULL DEFAULT 0,  -- step 2 (ChangeOrderTag) succeeded
+    orders_marked_paid INTEGER NOT NULL DEFAULT 0,  -- step 3 (ChangeStatus) succeeded
     error_summary      TEXT
 );
+
+-- Backfill columns on installs that pre-date the three-step counters.
+-- No production data to migrate — these are pure additions.
+ALTER TABLE sq_orders_pull_log
+    ADD COLUMN IF NOT EXISTS orders_created INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sq_orders_pull_log
+    ADD COLUMN IF NOT EXISTS orders_unparked INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sq_orders_pull_log
+    ADD COLUMN IF NOT EXISTS orders_marked_paid INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_sq_orders_pull_log_run_at
     ON sq_orders_pull_log (run_at DESC);

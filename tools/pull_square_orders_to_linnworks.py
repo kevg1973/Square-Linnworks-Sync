@@ -1,10 +1,25 @@
 """tools/pull_square_orders_to_linnworks.py — Phase 3.
 
 Pulls COMPLETED Square POS orders updated since the last
-watermark and creates matching orders in Linnworks. Idempotent
-via sq_square_orders_processed (Square order id is the dedup
-key) plus Linnworks' own (Source, SubSource, ReferenceNumber)
-natural dedup as a backstop.
+watermark and creates matching orders in Linnworks as a
+**three-step recipe** per DISCOVERIES.md §4:
+
+  1. POST Orders/CreateOrders         (JSON)              — create
+  2. POST Orders/ChangeOrderTag       (form-encoded)      — unpark
+  3. POST Orders/ChangeStatus status=1 (form-encoded)     — mark paid
+
+Steps 2+3 are critical: orders created via CreateOrders land
+parked, and ChangeStatus silently no-ops on parked orders. Without
+the unpark, the order would sit unprocessable in Linnworks.
+
+Idempotency at the Square order id level via
+sq_square_orders_processed plus Linnworks' own (Source, SubSource,
+ReferenceNumber) natural dedup as a backstop. The bookkeeping row
+is only inserted after **all three** Linnworks calls succeed —
+partial-success orders (e.g. create OK, unpark fails) are not
+recorded as processed and are retried on the next run. Linnworks'
+natural dedup means re-creating returns the same pkOrderID, so
+retries are cheap.
 
 ## Safety posture
 
@@ -394,6 +409,26 @@ def _create_linnworks_order(payload: dict[str, Any]) -> str:
     raise RuntimeError(f"unexpected CreateOrders response shape: {resp!r}")
 
 
+def _unpark_linnworks_order(pk_order_id: str) -> None:
+    """POST Orders/ChangeOrderTag to unpark. Per DISCOVERIES.md §4:
+    application/x-www-form-urlencoded with body
+    `orderIds=["<uuid>"]` (the value is a JSON-encoded array as a
+    string, then URL-encoded by the HTTP client). No other fields —
+    the endpoint name itself implies the unpark action.
+    """
+    form = {"orderIds": json.dumps([pk_order_id])}
+    linnworks.call("Orders/ChangeOrderTag", form_body=form)
+
+
+def _mark_paid_linnworks_order(pk_order_id: str) -> None:
+    """POST Orders/ChangeStatus status=1 (Paid) per DISCOVERIES.md §4.
+    Form-encoded. **MUST** run after the unpark — parked orders
+    silently no-op ChangeStatus (returns 200, doesn't change Status).
+    """
+    form = {"orderIds": json.dumps([pk_order_id]), "status": "1"}
+    linnworks.call("Orders/ChangeStatus", form_body=form)
+
+
 # ---------- bookkeeping helpers ----------
 
 
@@ -429,6 +464,9 @@ def _write_audit_row(
     orders_processed: int,
     orders_skipped: int,
     orders_failed: int,
+    orders_created: int,
+    orders_unparked: int,
+    orders_marked_paid: int,
     error_messages: list[str],
 ) -> None:
     summary = ""
@@ -437,15 +475,18 @@ def _write_audit_row(
         if len(error_messages) > 3:
             summary += f" | (+{len(error_messages) - 3} more)"
     payload = {
-        "run_at":           _now_iso(),
-        "mode":             mode,
-        "watermark_before": watermark_before.isoformat() if watermark_before else None,
-        "watermark_after":  watermark_after.isoformat() if watermark_after else None,
-        "orders_fetched":   orders_fetched,
-        "orders_processed": orders_processed,
-        "orders_skipped":   orders_skipped,
-        "orders_failed":    orders_failed,
-        "error_summary":    summary[:1000] if summary else None,
+        "run_at":             _now_iso(),
+        "mode":               mode,
+        "watermark_before":   watermark_before.isoformat() if watermark_before else None,
+        "watermark_after":    watermark_after.isoformat() if watermark_after else None,
+        "orders_fetched":     orders_fetched,
+        "orders_processed":   orders_processed,
+        "orders_skipped":     orders_skipped,
+        "orders_failed":      orders_failed,
+        "orders_created":     orders_created,
+        "orders_unparked":    orders_unparked,
+        "orders_marked_paid": orders_marked_paid,
+        "error_summary":      summary[:1000] if summary else None,
     }
     try:
         db.client().table("sq_orders_pull_log").insert(payload).execute()
@@ -461,7 +502,12 @@ def _print_payload_preview(order: dict[str, Any], payload: dict[str, Any]) -> No
     sq_id = order.get("id")
     sq_total = ((order.get("total_money") or {}).get("amount") or 0) / 100
     print(f"\n  ━━━ {sq_id} (total £{sq_total:.2f}, {len(payload['OrderItems'])} line(s)) ━━━")
-    print(json.dumps(payload, indent=2, default=str))
+    print("  Step 1: POST /api/Orders/CreateOrders  (JSON)")
+    print(json.dumps({"orders": [payload]}, indent=2, default=str))
+    print('  Step 2: POST /api/Orders/ChangeOrderTag  (form-encoded)')
+    print('    body: orderIds=["<pkOrderID from step 1>"]')
+    print('  Step 3: POST /api/Orders/ChangeStatus  (form-encoded)')
+    print('    body: orderIds=["<pkOrderID from step 1>"]&status=1')
 
 
 # ---------- main ----------
@@ -555,11 +601,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             orders_processed=0,
             orders_skipped=len(skipped_orders),
             orders_failed=0,
+            orders_created=0,
+            orders_unparked=0,
+            orders_marked_paid=0,
             error_messages=[],
         )
         print(
             f"\n=== PULL COMPLETE: fetched={fetched} processed=0 "
             f"skipped={len(skipped_orders)} failed=0 "
+            f"created=0 unparked=0 marked_paid=0 "
             f"watermark_before={watermark_before.isoformat()} watermark_after=(unchanged) "
             f"(observe mode) ==="
         )
@@ -567,16 +617,21 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ---------- write ----------
     print(
-        f"\n=== WRITE MODE — about to call Linnworks Orders/CreateOrders for "
+        f"\n=== WRITE MODE — about to run the 3-step recipe (create → unpark → mark paid) for "
         f"{len(new_orders)} order(s) ==="
     )
 
     successful: list[tuple[dict[str, Any], str]] = []
     failed: list[tuple[dict[str, Any], str]] = []
     error_messages: list[str] = []
+    created_count = 0
+    unparked_count = 0
+    marked_paid_count = 0
 
     for order in new_orders:
         sq_id = order.get("id") or "(no id)"
+
+        # Build payload
         try:
             payload = _build_linnworks_payload(order, sku_map)
         except Exception as e:
@@ -587,6 +642,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"  ✗ {sq_id} → {msg[:200]}")
             continue
 
+        # Step 1 — create
         try:
             pk = _create_linnworks_order(payload)
         except Exception as e:
@@ -594,23 +650,60 @@ def main(argv: Optional[list[str]] = None) -> int:
             _log_per_order_error(sq_id, msg, {"step": "create"})
             error_messages.append(f"{sq_id}: {msg}")
             failed.append((order, msg))
-            print(f"  ✗ {sq_id} → {msg[:200]}")
+            print(f"  ✗ {sq_id} create failed → {str(e)[:200]}")
             continue
+        created_count += 1
+        print(f"  ✓ {sq_id} created → pkOrderID {pk}")
 
+        # Step 2 — unpark. Failure here means the order exists in
+        # Linnworks but is still parked. We don't insert into the
+        # processed table, so the next run re-attempts; CreateOrders
+        # dedup returns the same pk cheaply.
+        try:
+            _unpark_linnworks_order(pk)
+        except Exception as e:
+            msg = f"create succeeded, unpark failed for pkOrderID={pk}: {e}"
+            _log_per_order_error(
+                sq_id, msg, {"step": "unpark", "linnworks_pk": pk}
+            )
+            error_messages.append(f"{sq_id}: {msg}")
+            failed.append((order, msg))
+            print(f"    ✗ unpark failed → {str(e)[:200]}")
+            continue
+        unparked_count += 1
+        print(f"    ✓ unparked")
+
+        # Step 3 — mark paid. Same recovery story: skip bookkeeping,
+        # next run retries the chain.
+        try:
+            _mark_paid_linnworks_order(pk)
+        except Exception as e:
+            msg = f"create+unpark succeeded, mark-paid failed for pkOrderID={pk}: {e}"
+            _log_per_order_error(
+                sq_id, msg, {"step": "mark_paid", "linnworks_pk": pk}
+            )
+            error_messages.append(f"{sq_id}: {msg}")
+            failed.append((order, msg))
+            print(f"    ✗ mark-paid failed → {str(e)[:200]}")
+            continue
+        marked_paid_count += 1
+        print(f"    ✓ marked paid")
+
+        # Bookkeeping insert. Linnworks side is fully done; if this
+        # fails we still count the order as successful so the
+        # watermark advances. The natural (Source, SubSource,
+        # ReferenceNumber) dedup protects us if the row never lands
+        # and the order is re-pulled later (within the 60s back-step
+        # or before the watermark moves past it).
         try:
             _record_processed(sq_id, pk, order)
         except Exception as e:
-            # Linnworks order created but bookkeeping failed — log
-            # loudly and treat as success for counters; the natural
-            # dedup on (Source, SubSource, ReferenceNumber) protects
-            # us from double-creation if this row never lands.
             sys.stderr.write(
                 f"[sq_square_orders_processed insert FAILED for {sq_id} → {pk}] {e}\n"
             )
             error_messages.append(f"{sq_id}: bookkeeping insert failed: {e}")
 
         successful.append((order, pk))
-        print(f"  ✓ {sq_id} → pkOrderID {pk}")
 
     # ---------- watermark ----------
     watermark_after: Optional[datetime] = None
@@ -639,6 +732,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         orders_processed=len(successful),
         orders_skipped=len(skipped_orders),
         orders_failed=len(failed),
+        orders_created=created_count,
+        orders_unparked=unparked_count,
+        orders_marked_paid=marked_paid_count,
         error_messages=error_messages,
     )
 
@@ -646,6 +742,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(
         f"=== PULL COMPLETE: fetched={fetched} processed={len(successful)} "
         f"skipped={len(skipped_orders)} failed={len(failed)} "
+        f"created={created_count} unparked={unparked_count} marked_paid={marked_paid_count} "
         f"watermark_before={watermark_before.isoformat()} "
         f"watermark_after={watermark_after.isoformat() if watermark_after else '(unchanged)'} ==="
     )
