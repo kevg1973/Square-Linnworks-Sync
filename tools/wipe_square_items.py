@@ -8,11 +8,11 @@ Appointments are NEVER touched.
 
 - **Default is observe-mode** (a dry run that prints what it would
   delete and exits). You must pass `--write` to actually delete.
-- **Only items with `item_data.product_type == "REGULAR"` are
-  candidates for deletion.** Items where `product_type` is
-  `"APPOINTMENTS_SERVICE"` are kept. Items with any other or
-  missing `product_type` are skipped and reported — we never delete
-  something we don't recognise.
+- **Only items with `item_data.product_type == "APPOINTMENTS_SERVICE"`
+  are preserved. Everything else is deleted** — including items
+  where `product_type` is `"REGULAR"`, missing entirely, or any
+  other unrecognised value. The keep-list is the contract; the
+  delete-list is "everything else".
 - `--limit N` caps the number of deletes per run, so a wipe can be
   staged in chunks.
 - Every run (observe or write) writes one row to `sq_wipe_log` for
@@ -50,13 +50,11 @@ PAGE_LIMIT = 100
 DELETE_BATCH_SIZE = 200
 SLEEP_BETWEEN_BATCHES = 0.2
 
-# Classification — keep these explicit. NEVER delete anything not
-# listed under PRODUCT_TYPE_DELETE.
-PRODUCT_TYPE_DELETE = "REGULAR"
+# Classification — APPOINTMENTS_SERVICE is the keep-list; everything
+# else is wiped.
 PRODUCT_TYPE_KEEP_SERVICE = "APPOINTMENTS_SERVICE"
 
 PREVIEW_DELETIONS = 20
-PREVIEW_OTHER_TYPES = 5
 
 
 # ---------- catalog walk ----------
@@ -74,13 +72,13 @@ def _fetch_page(cursor: Optional[str]) -> dict[str, Any]:
     return result or {}
 
 
-def _walk_catalog() -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
-    """Walk the entire catalog; return (to_delete, services, other) where
-    each entry is {id, name, product_type}.
+def _walk_catalog() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Walk the entire catalog; return (to_delete, services) where
+    each entry is {id, name, product_type}. Anything that isn't
+    APPOINTMENTS_SERVICE lands in to_delete.
     """
     to_delete: list[dict[str, str]] = []
     services: list[dict[str, str]] = []
-    other: list[dict[str, str]] = []
 
     cursor: Optional[str] = None
     pages = 0
@@ -100,18 +98,15 @@ def _walk_catalog() -> tuple[list[dict[str, str]], list[dict[str, str]], list[di
             product_type = item_data.get("product_type")
             entry = {"id": item_id, "name": name, "product_type": str(product_type)}
 
-            if product_type == PRODUCT_TYPE_DELETE:
-                to_delete.append(entry)
-            elif product_type == PRODUCT_TYPE_KEEP_SERVICE:
+            if product_type == PRODUCT_TYPE_KEEP_SERVICE:
                 services.append(entry)
             else:
-                other.append(entry)
+                to_delete.append(entry)
 
         print(
             f"    HTTP 200 — {len(objects)} item(s) returned, "
-            f"running totals: {len(to_delete)} REGULAR, "
-            f"{len(services)} APPOINTMENTS_SERVICE, "
-            f"{len(other)} other (walked={items_walked})"
+            f"running totals: {len(to_delete)} to-delete, "
+            f"{len(services)} APPOINTMENTS_SERVICE (walked={items_walked})"
         )
 
         cursor = response.get("cursor")
@@ -119,7 +114,7 @@ def _walk_catalog() -> tuple[list[dict[str, str]], list[dict[str, str]], list[di
             print(f"    no cursor — last page reached after page {pages}")
             break
 
-    return to_delete, services, other
+    return to_delete, services
 
 
 # ---------- batch delete ----------
@@ -235,9 +230,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         prog="wipe_square_items",
         description=(
             "DESTRUCTIVE. Walks the entire Square catalog and deletes "
-            "every retail item (product_type == REGULAR). Services "
-            "(APPOINTMENTS_SERVICE) are never touched. Items of any "
-            "other product_type are reported and skipped. "
+            "every item except APPOINTMENTS_SERVICE items. "
             "Default mode is OBSERVE (dry run). Pass --write to "
             "actually delete."
         ),
@@ -266,23 +259,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(banner)
 
     # ---------- walk ----------
-    to_delete, services, other = _walk_catalog()
-    items_walked = len(to_delete) + len(services) + len(other)
+    to_delete, services = _walk_catalog()
+    items_walked = len(to_delete) + len(services)
 
     # ---------- summary ----------
     print("\n" + "=" * 70)
     print("=== SUMMARY ===")
     print("=" * 70)
     print(f"Walked {items_walked} items.")
-    print(f"  REGULAR (retail):              {len(to_delete)} to delete")
-    print(f"  APPOINTMENTS_SERVICE (keep):   {len(services)} to keep")
-    print(f"  Other product_type (skipped):  {len(other)} (will not touch)")
-
-    if other:
-        n_show = min(PREVIEW_OTHER_TYPES, len(other))
-        print(f"\n--- first {n_show} 'other' product_type item(s) ---")
-        for o in other[:PREVIEW_OTHER_TYPES]:
-            print(f"  - id={o['id']}, product_type={o['product_type']!r}, name={o['name']!r}")
+    print(f"  To delete (everything except services): {len(to_delete)}")
+    print(f"  APPOINTMENTS_SERVICE (keep):            {len(services)}")
 
     # ---------- decide what we'd actually delete ----------
     deletions = to_delete
