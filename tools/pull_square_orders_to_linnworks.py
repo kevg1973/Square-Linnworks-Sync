@@ -387,6 +387,11 @@ def _build_order_items(
             pass
         price_per_unit = round((total_pence / 100) / qty, 4)
 
+        # Hit = the catalog_object_id resolved to a sq_sku_map row
+        # (i.e. it's a real product we know about). Miss = service /
+        # ad-hoc line falling back to title-as-SKU.
+        is_hit = entry is not None
+
         order_item: dict[str, Any] = {
             "SKU":          sku,
             "ChannelSKU":   sku,
@@ -397,6 +402,11 @@ def _build_order_items(
             "Discount":     0,
             "LineDiscount": 0,
             "TaxRate":      0,
+            # isService=false marks the line as a real stock-tracked
+            # product so Linnworks attempts to link it; isService=true
+            # tells Linnworks not to expect a stock link (services,
+            # ad-hoc lines).
+            "isService":    not is_hit,
         }
         # Strong-link to the Linnworks inventory record. Only set
         # when the lookup hit AND we have a UUID — Linnworks rejects
@@ -429,6 +439,11 @@ def _build_linnworks_payload(
         "DispatchBy":              dispatch_by.isoformat(),
         "LocationId":              LINNWORKS_DEFAULT_LOCATION,
         "Currency":                "GBP",
+        # Per Linnworks docs: without this top-level flag, Linnworks
+        # won't auto-link line items to stock records even when the
+        # SKU matches exactly. Required alongside StockItemId on the
+        # OrderItems for the line to land linked.
+        "AutomaticallyLinkBySKU":  True,
         "OrderItems":              _build_order_items(order, sku_map, verbose=verbose),
         "DeliveryAddress":         address,
         "BillingAddress":          dict(address),
