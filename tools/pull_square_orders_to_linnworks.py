@@ -401,7 +401,16 @@ def _build_order_items(
             "PricePerUnit": price_per_unit,
             "Discount":     0,
             "LineDiscount": 0,
-            "TaxRate":      0,
+            # VAT: shop is UK VAT-registered; product prices in
+            # Square are 20% VAT-inclusive, services are exempt.
+            # TaxCostInclusive=true tells Linnworks to back-calculate
+            # the VAT out of the gross PricePerUnit instead of
+            # adding it on top. UseChannelTax=true honours the rate
+            # we send rather than overriding from product/category
+            # defaults.
+            "TaxRate":         20 if is_hit else 0,
+            "TaxCostInclusive": True,
+            "UseChannelTax":   True,
             # isService=false marks the line as a real stock-tracked
             # product so Linnworks attempts to link it; isService=true
             # tells Linnworks not to expect a stock link (services,
@@ -444,6 +453,11 @@ def _build_linnworks_payload(
         # SKU matches exactly. Required alongside StockItemId on the
         # OrderItems for the line to land linked.
         "AutomaticallyLinkBySKU":  True,
+        # Honour the per-line TaxRate / TaxCostInclusive flags
+        # rather than letting Linnworks override from
+        # product/category defaults. Set at both order and
+        # line-item level per Linnworks API docs.
+        "UseChannelTax":           True,
         "OrderItems":              _build_order_items(order, sku_map, verbose=verbose),
         "DeliveryAddress":         address,
         "BillingAddress":          dict(address),
