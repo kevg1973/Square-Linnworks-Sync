@@ -174,17 +174,23 @@ def _save_watermark(ts: datetime) -> None:
 # ---------- sku map ----------
 
 
-def _load_sku_map() -> dict[str, str]:
-    """Returns variation_id → sku for everything in sq_sku_map.
-    Pre-loaded once per run; cheaper than per-order queries.
+def _load_sku_map() -> dict[str, dict[str, Optional[str]]]:
+    """Returns variation_id → {"sku": <sku>, "linnworks_item_id": <uuid>}
+    for every row in sq_sku_map. Pre-loaded once per run.
+
+    The Linnworks StockItemId UUID is included so each Square order
+    line can carry a strong-link reference back to the Linnworks
+    inventory record — without it, Linnworks shows the line as
+    "Unlinked item" and the tenant's process/dispatch flow blocks.
+    SKU text-match alone is insufficient.
     """
-    sku_map: dict[str, str] = {}
+    sku_map: dict[str, dict[str, Optional[str]]] = {}
     offset = 0
     while True:
         resp = (
             db.client()
             .table("sq_sku_map")
-            .select("sku, square_variation_id")
+            .select("sku, square_variation_id, linnworks_item_id")
             .range(offset, offset + SKU_MAP_PAGE_SIZE - 1)
             .execute()
         )
@@ -195,7 +201,10 @@ def _load_sku_map() -> dict[str, str]:
             vid = r.get("square_variation_id")
             sku = r.get("sku")
             if vid and sku:
-                sku_map[vid] = sku
+                sku_map[vid] = {
+                    "sku": sku,
+                    "linnworks_item_id": r.get("linnworks_item_id"),
+                }
         if len(rows) < SKU_MAP_PAGE_SIZE:
             break
         offset += SKU_MAP_PAGE_SIZE
@@ -329,31 +338,39 @@ def _build_address(order: dict[str, Any]) -> dict[str, str]:
 
 def _build_order_items(
     order: dict[str, Any],
-    sku_map: dict[str, str],
+    sku_map: dict[str, dict[str, Optional[str]]],
     *,
     verbose: bool = False,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for li in order.get("line_items") or []:
         cat_id = li.get("catalog_object_id") or ""
-        sku = sku_map.get(cat_id) if cat_id else None
+        entry = sku_map.get(cat_id) if cat_id else None
+
+        sku: Optional[str] = None
+        stock_item_id: Optional[str] = None
+        if entry:
+            sku = entry.get("sku")
+            stock_item_id = entry.get("linnworks_item_id")
+
         if not sku:
             # Service or ad-hoc line — fall back to the line name so
-            # Linnworks still records something sensible (and won't
-            # decrement stock since it's an unknown SKU).
+            # Linnworks still records something sensible. No StockItemId
+            # attached: the line will land "unlinked" and won't move
+            # stock, which is correct for non-stock-tracked services.
             title = (li.get("name") or "").strip()
             if verbose:
-                # Diagnostic for the observe-mode preview. If a
-                # catalog_object_id is present but missing from
-                # sq_sku_map, eyeball the printed id against the
-                # table — most-likely culprit when retail items go
-                # to fallback is an ID type mismatch (item id vs
-                # variation id).
                 print(
                     f"    [SKU lookup miss] catalog_object_id={cat_id!r} "
-                    f"falling back to title={title!r}"
+                    f"falling back to title={title!r} (will be unlinked)"
                 )
             sku = title or "UNKNOWN"
+        else:
+            if verbose:
+                print(
+                    f"    [SKU lookup hit] catalog_object_id={cat_id!r} → "
+                    f"sku={sku!r} stockitem={stock_item_id!r}"
+                )
         sku = sku.strip()
 
         try:
@@ -370,7 +387,7 @@ def _build_order_items(
             pass
         price_per_unit = round((total_pence / 100) / qty, 4)
 
-        items.append({
+        order_item: dict[str, Any] = {
             "SKU":          sku,
             "ChannelSKU":   sku,
             "ItemNumber":   sku,
@@ -380,13 +397,21 @@ def _build_order_items(
             "Discount":     0,
             "LineDiscount": 0,
             "TaxRate":      0,
-        })
+        }
+        # Strong-link to the Linnworks inventory record. Only set
+        # when the lookup hit AND we have a UUID — Linnworks rejects
+        # empty/null StockItemId values, and unlinked services
+        # shouldn't carry a stale or fabricated UUID.
+        if stock_item_id:
+            order_item["StockItemId"] = stock_item_id
+
+        items.append(order_item)
     return items
 
 
 def _build_linnworks_payload(
     order: dict[str, Any],
-    sku_map: dict[str, str],
+    sku_map: dict[str, dict[str, Optional[str]]],
     *,
     verbose: bool = False,
 ) -> dict[str, Any]:
