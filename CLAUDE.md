@@ -1,49 +1,54 @@
 # Linnworks ↔ Square Sync — Project State
 
-## Current State (May 3, 2026)
+## Current State (May 6, 2026)
 
 **Project location**: `/Volumes/Music/Github/Square Linnworks Sync` (local),
 `kevg1973/Square-Linnworks-Sync` (private GitHub repo).
 
 **Goal**: Replace the legacy Square sync with a clean rebuild.
 Linnworks is the source of truth (~100 orders/day across Shopify and
-eBay). Square is used for POS + Appointments only. **Cutover before
-the shop reopens Tuesday morning.**
+eBay). Square is used for POS + Appointments only. **Cutover complete
+— sync is live in production.**
 
-**Stack**: Python 3.12, GitHub Actions cron, Supabase (project
-`cart-upsell-tracker`, all tables prefixed `sq_*`), £0/month.
+**Stack**: Python 3.12, Railway cron (scheduled jobs, Dockerfile-built),
+GitHub Actions (manual triggers only — observe-mode debugging, probes,
+wipe), Supabase (project `cart-upsell-tracker`, all tables prefixed
+`sq_*`).
 
 **Phase status**:
 
 | Phase | What | Status |
 |---|---|---|
-| **0a** | Repo skeleton + auth smoke test                        | ✅ complete (2026-05-01) |
-| **0b** | Diagnostic probes (Square scopes, Linnworks endpoints) | ✅ complete (2026-05-02) — 4/4 probes green, mark-paid recipe locked in |
-| **1**  | Wipe + rebuild Square's retail catalog from Linnworks  | ⏳ tools built and observe-verified, **write-mode runs pending** |
-| 2      | Stock-push cron (Linnworks → Square, every 15 min)     | not started |
-| 3      | Order-pull cron (Square → Linnworks, every 5 min)      | not started |
-| 4      | Operational dashboard                                   | not started |
+| **0a** | Repo skeleton + auth smoke test                              | ✅ complete (2026-05-01) |
+| **0b** | Diagnostic probes (Square scopes, Linnworks endpoints)       | ✅ complete (2026-05-02) — 4/4 probes green, mark-paid recipe locked in |
+| **1**  | Wipe + rebuild Square's retail catalog from Linnworks        | ✅ complete — catalog rebuilt, ~4,193 retail items live |
+| **2**  | Sync cron (Linnworks → Square, every 30 min on Railway)      | ✅ complete — running on Railway as the `sync` service |
+| **3**  | Order-pull cron (Square → Linnworks, every 5 min on Railway) | ✅ complete — verified end-to-end with a real Square test order |
+| 4      | Operational dashboard                                         | not started |
 
 ## What's been built and tested
 
-### Wipe tool — ✅ COMPLETE, observe-verified
+### Wipe tool — ✅ COMPLETE
 
 `tools/wipe_square_items.py` + `.github/workflows/wipe-square-items.yml`.
 
 - Walks the entire Square catalog, classifies each item by
-  `item_data.product_type`.
-- Observe run reports: **would delete 7,381 REGULAR retail items, keep
-  9 APPOINTMENTS_SERVICE**. Anything with an unknown/missing
+  `item_data.product_type`. Anything with an unknown/missing
   `product_type` is skipped and reported (never deleted).
 - `--write` flag required to actually delete; default is observe.
   Workflow `mode` input dropdown also defaults to `observe`.
 - `--limit N` for staged write runs.
 - Audit log to `sq_wipe_log` (one row per run, observe or write).
+- Cutover wipe deleted ≈7,381 retail items, kept 9 services.
+- Manual-only — no schedule. Triggered via GitHub Actions
+  `workflow_dispatch`.
 
-### Sync tool — ✅ OBSERVE WORKING, write-mode pending
+### Sync tool — ✅ LIVE (Railway, every 30 min)
 
-`tools/sync_linnworks_to_square.py` +
-`.github/workflows/sync-linnworks-to-square.yml`.
+`tools/sync_linnworks_to_square.py`, deployed via `railway.sync.json`
+(builder: Dockerfile). GitHub Actions workflow
+`.github/workflows/sync-linnworks-to-square.yml` retained for manual
+observe-mode runs (`schedule:` block commented out).
 
 - Pulls all Linnworks SKUs via `Stock/GetStockItemsFull` (paged 200
   at a time; partial-page detection for end-of-catalog), walks
@@ -56,35 +61,39 @@ the shop reopens Tuesday morning.**
   `inventory/changes/batch-create` as `PHYSICAL_COUNT` against
   `L74KSP08AJ2GH`.
 - `--write` flag, `--limit N`, audit log to `sq_lw_sync_log`.
+- Railway cron always invokes with `--write`. GitHub `workflow_dispatch`
+  defaults to observe, kept for ad-hoc dry runs and staged rollouts.
 
-**Latest observe-run breakdown (pre-wipe)**:
+### Order-pull tool — ✅ LIVE (Railway, every 5 min)
 
-| Metric | Value |
-|---|---|
-| Linnworks items pulled                | 4,193 |
-| Square REGULAR SKUs walked            | 6,354 |
-| Duplicate Square SKUs ignored         | 1,027 |
-| Would CREATE                          | 105 |
-| Would UPDATE (mostly price fixes)     | 400 |
-| Would STOCK_ONLY                      | 2,338 |
-| Would NO_OP                           | 1,350 |
+`tools/pull_square_orders_to_linnworks.py`, deployed via
+`railway.pull.json` (builder: Dockerfile). GitHub Actions workflow
+`.github/workflows/pull-square-orders-to-linnworks.yml` retained for
+manual observe-mode runs (`schedule:` block commented out).
 
-**Recent fixes (since the latest observe run)**:
+- Pulls Square orders since `sq_watermarks.square_orders_last_pulled_at`,
+  creates Linnworks orders idempotently keyed on
+  `(Source, SubSource, ReferenceNumber)` where `ReferenceNumber` is
+  derived deterministically from Square's `order_id`.
+- Two-step mark-paid: `Orders/ChangeOrderTag` (unpark) →
+  `Orders/ChangeStatus` (status=1). Both
+  `application/x-www-form-urlencoded`. (See *Discoveries* for the
+  recipe — skipping the unpark makes step 2 silently no-op.)
+- Line items linked to existing Linnworks stock items by SKU
+  (`AutomaticallyLinkBySKU`), with the resolved Linnworks
+  `StockItemId` attached on the line so Linnworks decrements stock on
+  payment.
+- VAT is back-calculated from Linnworks-stored VAT-inclusive prices.
+- Service-SKU line items flagged with `isService` so Linnworks
+  doesn't try to decrement a stock item.
+- Watermark advances on success; orders already in
+  `sq_square_orders_processed` are skipped without reprocessing.
+- Audit log to `sq_orders_pull_log` (per-run summary).
 
-- Linnworks pagination now terminates cleanly via partial-page
-  detection (and treats a follow-up HTTP 400 as expected
-  end-of-catalog only when the previous page was already partial).
-  Was previously propagating the 400 from page 22 as an error.
-  Commit `4787c4c`.
-- The final `=== SYNC COMPLETE: ===` summary line and the
-  `sq_lw_sync_log` audit row now use plan-phase action counts
-  (`len(creates)` etc.) regardless of mode, with `failed` tracked
-  separately. The previous version hardcoded zeros in observe mode
-  and double-counted failures in write mode. Commit `cde7412`.
-
-A re-run in observe mode is the next sanity check before write-mode
-can be trusted — the summary line should now match the PLAN block
-exactly.
+End-to-end verified: real Square test order placed at the till →
+landed in Linnworks within 5 min via Railway cron, with linked stock
+item, correct VAT extraction, paid status, idempotency on re-run, and
+watermark advance.
 
 ## Discoveries to remember
 
@@ -125,10 +134,10 @@ the production-relevant summary.
 - **Catalog upsert is keyed on Square's catalog object id, not SKU.**
   The mapping has to be remembered (we re-derive it from the catalog
   walk on each sync run for now; will be cached in `sq_sku_map` once
-  the cron lands).
+  that table is wired up).
 - **Square location ID**: `L74KSP08AJ2GH` (Northwest Guitars). Pinned
-  in code — will be promoted to a `SQUARE_LOCATION_ID` env var when
-  Phase 2 cron lands.
+  in code — should be lifted to a `SQUARE_LOCATION_ID` env var when
+  convenient.
 - **Catalog and Inventory are separate APIs.** Two write calls per
   item per push (one upsert, one stock change).
 - **Rate limit**: 10 req/sec. Generous, but use batch endpoints.
@@ -152,7 +161,7 @@ the production-relevant summary.
   cleanly; if a 400 fires after a known partial page, it's treated as
   end-of-catalog. Anywhere else, a 400 propagates as a real error.
 
-### `Orders/CreateOrders` (Phase 3 prep, locked in by probe)
+### `Orders/CreateOrders`
 
 - `POST /api/Orders/CreateOrders` — JSON body `{"orders": [<order>]}`.
   Plural; even for a single order. Response is a bare JSON array of
@@ -162,9 +171,9 @@ the production-relevant summary.
   `LocationId`, `Currency`, `OrderItems`, `DeliveryAddress`,
   `BillingAddress`. The address must be named `DeliveryAddress`,
   NOT `ShippingAddress`.
-- **Dedup key** is `(Source, SubSource, ReferenceNumber)`. Phase 3's
-  order-pull should derive `ReferenceNumber` deterministically from
-  Square's order id so retries are naturally idempotent.
+- **Dedup key** is `(Source, SubSource, ReferenceNumber)`. Order-pull
+  derives `ReferenceNumber` deterministically from Square's order id
+  so retries are naturally idempotent.
 - Direct-source orders land **parked** (`IsParked: true`).
 
 ### Mark-as-paid recipe (locked in 2026-05-02 by UI capture)
@@ -185,7 +194,7 @@ makes step 2 silently no-op (returns 200, doesn't change `Status`).
 Linnworks server-side stamps `PaidDateTime` automatically when
 `Status` flips to `1`.
 
-## Required GitHub Actions secrets (all 7 set)
+## Required environment variables (all 7 set on both platforms)
 
 ```
 LINNWORKS_APP_ID
@@ -197,8 +206,16 @@ SUPABASE_URL              (https://miicdzowfzxffnorlqzp.supabase.co)
 SUPABASE_SERVICE_KEY
 ```
 
-All seven go into GitHub repo Settings → Secrets and variables →
-Actions as repository secrets. None are committed to the repo.
+- **GitHub Actions**: repository secrets in Settings → Secrets and
+  variables → Actions. Used by manual `workflow_dispatch` runs (sync,
+  pull, probes, wipe).
+- **Railway**: per-service environment variables in each service's
+  Settings → Variables. Used by the live cron services. Both `sync`
+  and `pull` services need their own copy.
+- None are committed to the repo.
+
+When rotating a secret, rotate it in **both** places. The two stacks
+share no env state.
 
 ## Repo structure
 
@@ -209,111 +226,100 @@ Square-Linnworks-Sync/
 │   ├── probe-square-scopes.yml
 │   ├── probe-square-catalog.yml
 │   ├── probe-square-duplicates.yml
+│   ├── probe-square-orders-recent.yml
+│   ├── probe-square-services.yml
 │   ├── probe-linnworks-create-orders.yml
 │   ├── probe-linnworks-mark-paid.yml
 │   ├── probe-supabase-write-pattern.yml
-│   ├── wipe-square-items.yml              ✅
-│   └── sync-linnworks-to-square.yml       ✅ (observe verified)
+│   ├── wipe-square-items.yml                  ✅ manual only
+│   ├── sync-linnworks-to-square.yml           ✅ manual only (Railway runs the cron)
+│   └── pull-square-orders-to-linnworks.yml    ✅ manual only (Railway runs the cron)
 ├── lib/                  config.py, linnworks.py, square.py, db.py
 ├── probes/               probe_*.py (Phase 0b artefacts)
 ├── tools/
 │   ├── __init__.py
-│   ├── wipe_square_items.py               ✅
-│   └── sync_linnworks_to_square.py        ✅ (observe verified)
-├── supabase/001_initial.sql               sq_* tables incl. sq_wipe_log + sq_lw_sync_log
+│   ├── wipe_square_items.py                   ✅
+│   ├── sync_linnworks_to_square.py            ✅ (Railway cron, every 30 min)
+│   └── pull_square_orders_to_linnworks.py     ✅ (Railway cron, every 5 min)
+├── supabase/001_initial.sql                   sq_* tables (incl. sq_wipe_log, sq_lw_sync_log, sq_orders_pull_log)
+├── Dockerfile                                 shared image used by both Railway services
+├── railway.sync.json                          sync service config (cron */30, --write)
+├── railway.pull.json                          pull service config (cron */5,  --write)
+├── RAILWAY.md                                 Railway setup notes
 ├── CLAUDE.md
 ├── LINNWORKS_REFERENCE.md
 ├── DISCOVERIES.md
 └── requirements.txt
 ```
 
-## Cutover plan (target: Monday before EOD)
+## Cutover (complete)
 
-**Precondition** (do this once before any of the steps below):
-paste the contents of `supabase/001_initial.sql` into the Supabase
-SQL Editor and run, then run `NOTIFY pgrst, 'reload schema';` in a
-fresh query. The migration is idempotent (every CREATE uses
-`IF NOT EXISTS`), and the NOTIFY is what makes PostgREST's API
-actually see new tables — without it, audit-row inserts fail with
-`PGRST205` even when the table exists in the database.
+The Tuesday-morning cutover landed and the production stack is live.
+Sequence (chronology in git log):
 
-1. Re-run **Sync — Linnworks → Square** in observe mode. Verify the
-   summary line now matches the PLAN block exactly (post-`cde7412`
-   fix), and the breakdown still looks sensible (≈4,193 Linnworks
-   items, mostly CREATE after wipe).
-2. Maintenance window opens (shop closed).
-3. Run **Wipe — Square retail items** with `mode=write`. Deletes
-   ≈7,381 retail items, keeps 9 services. Audit row in `sq_wipe_log`.
-4. Verify Square dashboard shows only services in the Item library.
-5. Run **Sync — Linnworks → Square** with `mode=write`. Creates
-   ≈4,193 retail items and pushes stock from Linnworks. Audit row
-   in `sq_lw_sync_log`.
-6. Verify Square dashboard populated correctly.
-7. Kill the legacy sync app.
-8. Monitor for an hour.
-9. Tuesday morning: shop reopens, till works.
+1. ✅ Migration applied + `NOTIFY pgrst, 'reload schema';`.
+2. ✅ Wipe in `--write` mode: ≈7,381 retail items deleted, 9 services kept.
+3. ✅ Sync in `--write` mode: ≈4,193 retail items created, stock pushed.
+4. ✅ Legacy sync app killed.
+5. ✅ Phase 2 sync cron live (initially on GHA, then moved to Railway).
+6. ✅ Phase 3 order-pull cron live (initially on GHA, then moved to Railway).
+7. ✅ End-to-end verification with a real Square test order: linked
+   stock item, correct VAT extraction, paid status, idempotent on
+   re-run, watermark advanced.
 
-## Open issues / next session
+## Open issues / backlog
 
-**Pre-cutover checklist** (must clear before any `--write` run):
+**Active issues**:
 
-- **Run the migration.** Editing `supabase/001_initial.sql` in the
-  repo only changes the file — it does not touch the live database.
-  `sq_lw_sync_log` was added to the SQL on 2026-05-03 but the
-  CREATE wasn't actually executed against Supabase until the
-  audit-insert started failing with `PGRST205`. Always do **both**
-  in the Supabase SQL Editor after a migration change: paste the
-  full file → Run, then run `NOTIFY pgrst, 'reload schema';` so
-  PostgREST sees the new tables. The schema-cache `NOTIFY` alone
-  doesn't create anything.
-- **Confirm the observe-run summary line matches the PLAN block**
-  after the `cde7412` counter fix. If they don't match for any
-  reason, do not run `--write` yet.
+- **PostgREST schema cache flush** — `sq_orders_pull_log` insert is
+  recurring-failing for the `orders_skipped_empty` column. Likely a
+  schema mismatch between the table definition and what the tool is
+  trying to write. Fix path: confirm the column exists in
+  `supabase/001_initial.sql`, paste the migration into the Supabase
+  SQL Editor, then run `NOTIFY pgrst, 'reload schema';`.
+- **Categories on Square items** — POS usability. Sync currently
+  doesn't push categories; staff see a flat item list at the till.
+- **Service order end-to-end test** — the `isService` flag on
+  service-SKU line items is set, but the full flow hasn't been
+  exercised by a real booking yet. Will be validated by the next
+  service order through the till.
+- **429 rate-limit retry/backoff in sync tool** — currently sleeps
+  0.2s between batches; if Square returns a 429 the sync just fails.
+  Add exponential backoff with retry on 429.
+- **`sq_lw_sync_log` retention policy** — table grows unbounded; one
+  row per sync run × every 30 min ≈ 48 rows/day ≈ 17k/year. Add a
+  periodic prune (keep last 30 days?) or move to a Supabase cron.
 
-**Deferred (out of cutover scope)**:
+**Deferred (out of scope for now)**:
 
 - **Image sync.** Basic SKU/name/price/stock first; product
-  pictures are a follow-up after cutover.
+  pictures are a follow-up.
 - **Per-supplier code cache, sales velocity ingest from Script 47**,
   etc.
 - **Promote `SQUARE_LOCATION_ID` to an env var.** Currently
-  hardcoded as `L74KSP08AJ2GH` across the tools. Lift to config
-  when the Phase 2 cron lands.
-- **`sq_sku_map` is unused.** Schema exists but nothing writes to
-  it yet; the sync re-derives the SKU↔catalog-id mapping on every
-  observe/write run by walking Square's catalog. Phase 2 cron will
-  populate this table to skip no-op writes between runs.
-
-**Phase 2/3 still to build**:
-
-- **Phase 2 — stock-push cron** (`stock-push.yml`, every 15 min,
-  Linnworks → Square). The Phase 1 sync tool is a one-shot manual
-  rebuild; the cron is the recurring delta sync. Most of the
-  Linnworks pull / Square upsert / inventory-push code can lift
-  directly from the sync tool.
-- **Phase 3 — order-pull cron** (`order-pull.yml`, every 5 min,
-  Square → Linnworks). Creates Linnworks orders from Square POS
-  sales. Mark-paid recipe is locked in (see *Discoveries*) — the
-  build is mostly: pull Square orders since watermark, idempotently
-  create Linnworks orders, unpark via `ChangeOrderTag`, mark paid
-  via `ChangeStatus(status=1)`, advance watermark.
+  hardcoded as `L74KSP08AJ2GH` across the tools.
+- **`sq_sku_map` is unused.** Schema exists but nothing populates it
+  yet; sync re-derives the SKU↔catalog-id mapping on every run by
+  walking Square's catalog. Caching it would let the sync skip no-op
+  writes between runs.
 - **Phase 4 — operational dashboard.** Reads `sq_sync_runs`,
-  `sq_errors`, `sq_wipe_log`, `sq_lw_sync_log`, surfaces last-run
-  status and recent errors. Shape TBD.
+  `sq_errors`, `sq_wipe_log`, `sq_lw_sync_log`, `sq_orders_pull_log`,
+  surfaces last-run status and recent errors. Shape TBD.
 - **Phase 5 — orphan-deletion path on reconciliation** with a
   confirm step.
 
 ## Operational gotchas
 
 - **Repo lives on external SSD** `/Volumes/Music/`. Must be mounted
-  to commit (not to run workflows — those run on GitHub-hosted
-  runners regardless of local mount state).
+  to commit (Railway and GitHub Actions both run from the cloud, so
+  scheduled crons are unaffected by local mount state).
 - **macOS leaks `._*` AppleDouble files** when copying onto FAT/exFAT
   volumes. `.gitignore` should swallow them; if any sneak in, delete
   with `find . -name '._*' -delete`.
-- **Supabase free Nano projects pause after 7 days inactivity.** If a
-  workflow run starts failing with connection errors, check the
-  Supabase dashboard and unpause if needed.
+- **Supabase free Nano projects pause after 7 days inactivity.** Now
+  that the sync runs every 30 min the project shouldn't go idle on
+  its own — but if cron runs start failing with connection errors,
+  check the Supabase dashboard and unpause if needed.
 - **Linnworks**: rate limit ~1 req/sec, auth header is the raw token
   (no `Bearer` prefix), 401 → re-auth + retry once.
 - **After modifying `supabase/001_initial.sql`**: paste into the
@@ -322,10 +328,18 @@ actually see new tables — without it, audit-row inserts fail with
   PostgREST sees new tables. Without the NOTIFY, audit inserts will
   fail with `PGRST205` for ~minutes until the cache naturally
   refreshes.
+- **Railway env vars are per-service.** When rotating a secret,
+  update **both** Railway services AND the GitHub Actions repo
+  secrets. The two stacks share no env state.
+- **Both Railway services build from the same `Dockerfile`.** The
+  per-service `railway.*.json` overrides only the `startCommand` and
+  `cronSchedule`. If the Dockerfile breaks, both services fail to
+  build — there's no independent failure isolation at the build
+  layer (only at runtime).
 - **`LINNWORKS_REFERENCE.md`** in the repo has the full Linnworks API
-  working reference (auth, gotchas, the `Dashboards/ExecuteCustomPagedScript`
-  form-encoding trick, etc.). Read it before writing new Linnworks
-  endpoint code.
+  working reference (auth, gotchas, the
+  `Dashboards/ExecuteCustomPagedScript` form-encoding trick, etc.).
+  Read it before writing new Linnworks endpoint code.
 
 ## Working method (Kevin's preference)
 
@@ -341,48 +355,61 @@ actually see new tables — without it, audit-row inserts fail with
 - Reliable solutions over fancy ones — was burned by macOS permission
   battles during a previous build.
 
-## Architecture (the eventual shape, post-cutover)
+## Architecture (current production shape)
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         GITHUB ACTIONS                               │
-│                                                                      │
-│  ┌────────────────────────┐         ┌────────────────────────────┐  │
-│  │ stock-push.yml         │         │ order-pull.yml             │  │
-│  │ cron: every 15 min     │         │ cron: every 5 min          │  │
-│  │ Linnworks → Square     │         │ Square → Linnworks         │  │
-│  └───────────┬────────────┘         └────────────┬───────────────┘  │
-│              │                                    │                  │
-│  ┌───────────┴────────────────────────────────────┴───────────────┐ │
-│  │ reconcile.yml (workflow_dispatch only — manual trigger)        │ │
-│  │ Read-only audit: writes CSV report to artifact                 │ │
-│  └───────────┬────────────────────────────────────────────────────┘ │
-└──────────────┼──────────────────────────────────────────────────────┘
-               │
-               ▼
-       ┌───────────────┐         ┌──────────────┐         ┌────────────┐
-       │   LINNWORKS   │◄───────►│   SUPABASE   │◄───────►│   SQUARE   │
-       │  (truth)      │         │  (audit log, │         │  (POS)     │
-       │               │         │   sku map,   │         │            │
-       │               │         │   watermarks)│         │            │
-       └───────────────┘         └──────────────┘         └────────────┘
+              ┌────────────────────────────────────┐
+              │           RAILWAY (cron)           │
+              │                                    │
+              │  ┌──────────────────────────────┐  │
+              │  │ sync service                 │  │
+              │  │ railway.sync.json            │  │
+              │  │ */30 * * * *                 │  │
+              │  │ python -m tools.sync_...     │  │
+              │  └──────────────┬───────────────┘  │
+              │                 │                  │
+              │  ┌──────────────┴───────────────┐  │
+              │  │ pull service                 │  │
+              │  │ railway.pull.json            │  │
+              │  │ */5 * * * *                  │  │
+              │  │ python -m tools.pull_...     │  │
+              │  └──────────────┬───────────────┘  │
+              └─────────────────┼──────────────────┘
+                                │
+              ┌─────────────────┼──────────────────┐
+              │     GITHUB ACTIONS (manual only)   │
+              │                 │                  │
+              │  workflow_dispatch:                │
+              │   - sync (observe-mode debugging)  │
+              │   - pull (observe-mode debugging)  │
+              │   - probes (probe_* workflows)     │
+              │   - wipe (destructive, manual)     │
+              │  schedule: blocks commented out    │
+              └─────────────────┼──────────────────┘
+                                │
+                                ▼
+       ┌───────────────┐    ┌──────────────┐    ┌────────────┐
+       │   LINNWORKS   │◄──►│   SUPABASE   │◄──►│   SQUARE   │
+       │   (truth)     │    │  (audit log, │    │   (POS)    │
+       │               │    │   sku map,   │    │            │
+       │               │    │   watermarks)│    │            │
+       └───────────────┘    └──────────────┘    └────────────┘
 ```
 
-The Phase 1 wipe + sync tools are the manual one-shot equivalent of
-what the Phase 2 cron will eventually do automatically. Once the
-catalog is rebuilt cleanly, Phase 2 takes over for the recurring
-delta sync.
+Both Railway services build from the shared `Dockerfile` at the repo
+root. Each picks its own start command + cron schedule via its
+`railway.*.json` config-as-code file.
 
-## Stock decrement flow (the eventual loop, post-Phase-3)
+## Stock decrement flow (live)
 
 ```
 Square sale fires (POS at till)
     │
     ▼
-order-pull cron picks it up (within 5 min)
+order-pull cron picks it up (within 5 min, Railway)
     │
     ▼
-Create Linnworks order (Source = "DIRECT")
+Create Linnworks order (Source = "DIRECT", SKU-linked, paid)
     │
     ▼
 Two-step mark-paid (ChangeOrderTag → ChangeStatus status=1)
@@ -392,7 +419,7 @@ Order sits "open" in Linnworks for Kevin to process manually
     │
     │ (meanwhile, separately:)
     ▼
-stock-push cron runs (every 15 min)
+sync cron runs (every 30 min, Railway)
     │
     ▼
 Reads current Linnworks stock for all SKUs
@@ -407,14 +434,43 @@ decrement, no race conditions on the truth.
 
 ## Why these choices (preserved historical context)
 
-### Why GitHub Actions and not Railway / Cloudflare
+### Why Railway cron and not GitHub Actions
 
-GitHub Actions cron is genuinely free for this workload. Every run
-is a clickable log in the Actions tab — directly addresses the "I
-have no control over the old app when it breaks" pain point.
-Cloudflare Workers cron has been observed to silently stop firing
-for 24+ hours; Railway Hobby would work but costs £4/month for
-nothing this stack doesn't already have.
+GitHub Actions cron is free, but on the free tier the scheduler queue
+silently throttles. `*/5` and `*/30` schedules were observed firing
+30–90 minutes late under load — one observed: 69 min between a Square
+sale at the till and the order landing in Linnworks. That blew the
+acceptable staleness budget. Railway provides deterministic cron
+scheduling and was the smallest blast-radius change: same Python code,
+same Dockerfile, just a different scheduler.
+
+GitHub Actions is retained for manual operations only:
+- Manual `workflow_dispatch` runs of the sync tool (e.g., to force an
+  immediate reconciliation, or to run in observe mode for debugging).
+- Manual `workflow_dispatch` runs of the order-pull tool (same — for
+  observe-mode debugging or one-off backfills).
+- The wipe tool (intentionally only manual — destructive operation).
+- Probes (`probe_*` workflows).
+
+The `schedule:` blocks in both cron workflow YAMLs are commented out
+to prevent double-runs while Railway is the source of truth.
+
+(Originally we picked GHA because: free, every run is a clickable log
+in the Actions tab — directly addressed the "I have no control over
+the old app when it breaks" pain point. Cloudflare Workers cron has
+been observed to silently stop firing for 24+ hours, which is why we
+didn't pick that. Railway was deferred at the time because it cost
+£4/month for nothing the GHA stack didn't already have — but the GHA
+scheduler unreliability flipped that calculation once we needed the
+*/5 cadence reliably.)
+
+### Why Dockerfile and not Nixpacks / Railpack
+
+Nixpacks is deprecated; Railway's current default is Railpack. Rather
+than chase Railway's specific config formats (which keep changing), a
+plain `Dockerfile` is vendor-neutral and predictable. Same image
+locally, on Railway, or anywhere else with a Docker runtime. Easy
+escape hatch if Railway pricing or reliability changes.
 
 ### Why Python and not Node
 
@@ -432,19 +488,20 @@ prefixed `sq_*` to avoid collisions with the host project.
 
 ### Why two crons instead of one daemon
 
-Independent failure domains. If `stock-push` breaks, orders still
-flow. If `order-pull` breaks, stock still updates. No always-on
-service to babysit.
+Independent failure domains. If `sync` breaks, orders still flow.
+If `pull` breaks, stock still updates. No always-on service to
+babysit. (Railway runs them as two separate services, so this
+property carried forward from the GHA-era design unchanged.)
 
 ### Why a few minutes of staleness is acceptable
 
 Northwest Guitars does ~100 orders/day across Shopify/eBay. A 5–20
 minute stock-level lag is within tolerance — POS staff can see what's
-physically on the shelf, and the count reconciles within 20 minutes
-worst-case. The double-sell race (last unit sold on Shopify in the
-same window as a POS sale at the till) is rare and would be handled
-the same way as today (apologise, refund). Webhooks aren't worth the
-complexity for a once-a-month edge case.
+physically on the shelf, and the count reconciles within ~30 minutes
+worst-case (next sync tick). The double-sell race (last unit sold on
+Shopify in the same window as a POS sale at the till) is rare and
+would be handled the same way as today (apologise, refund). Webhooks
+aren't worth the complexity for a once-a-month edge case.
 
 ## State management (Supabase tables)
 
@@ -452,9 +509,10 @@ All prefixed `sq_` to avoid collision with the host project.
 
 | Table | Purpose |
 |---|---|
-| `sq_sku_map` | Spine for the eventual cron. One row per SKU; links Linnworks `StockItemId` to Square `catalog_object_id` + `variation_id`; caches `last_known_stock` and `last_known_price` for no-op skipping. Not yet populated — Phase 2 cron will write to this. |
+| `sq_sku_map` | Spine intended for sync caching. One row per SKU; links Linnworks `StockItemId` to Square `catalog_object_id` + `variation_id`; caches `last_known_stock` and `last_known_price` for no-op skipping. **Not yet populated** — sync still re-derives the mapping from a catalog walk on every run. |
 | `sq_sync_runs` | One row per cron execution (job_name, started_at, finished_at, status, items_processed/changed/errors, github_run_url). Used by `lib/db.py` `sync_run_start`/`sync_run_finish`. **Not the same as `sq_lw_sync_log`** — different shape and lifecycle. |
-| `sq_square_orders_processed` | Audit + idempotency for order-pull. Keyed on Square's `order_id`. Phase 3. |
+| `sq_square_orders_processed` | Idempotency for order-pull. Keyed on Square's `order_id`. |
+| `sq_orders_pull_log` | Audit row per order-pull run (orders pulled / created / skipped / etc.). Currently has a recurring `orders_skipped_empty` insert failure — see backlog. |
 | `sq_errors` | Per-error log for non-fatal failures during a sync run. |
 | `sq_watermarks` | Key-value cursors (e.g. `square_orders_last_pulled_at`). |
 | `sq_wipe_log` | Audit row per wipe-tool run (observe or write). UUID PK, mode, walked/deleted/failed/kept counts, error_summary. |
@@ -486,3 +544,8 @@ catalog discriminator.
 - Heuristic service detection via `available_for_booking` /
   `service_duration` / `team_member_ids` — unreliable on this tenant.
   Use `product_type == "APPOINTMENTS_SERVICE"` instead.
+- **GitHub Actions free-tier scheduled cron** for the `*/5` order-pull
+  cadence — scheduler queue silently throttles, ticks delivered 30–90
+  min late. Migrated to Railway. GHA retained for manual runs only.
+- **Nixpacks builder on Railway** — deprecated upstream. Switched to
+  a plain Dockerfile for vendor neutrality.
