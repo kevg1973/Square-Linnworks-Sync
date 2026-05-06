@@ -1,7 +1,12 @@
 # Secrets — never commit
 .env
 .env.local
+.env.*
 *.env
+Secrets.txt
+secrets.txt
+*.pem
+*.key
 
 # Python
 __pycache__/
