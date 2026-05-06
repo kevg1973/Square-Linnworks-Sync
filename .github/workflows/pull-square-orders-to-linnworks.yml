@@ -1,19 +1,18 @@
 name: Pull — Square orders → Linnworks
 
-# Two triggers:
-#   - schedule: every 30 min, always --write, no limit (the cron).
-#     Was */5 originally; GitHub Actions' free-tier scheduler queue
-#     was intermittently delivering 5-min ticks 30+ minutes late
-#     (one observed: 69 min between a Square sale and the Linnworks
-#     order landing). */30 is more reliable on the free tier.
+# Scheduling moved to Railway. Manual triggers via workflow_dispatch only.
+#   GitHub Actions' free-tier scheduler queue was intermittently
+#   delivering 5-min ticks 30+ minutes late (one observed: 69 min
+#   between a Square sale and the Linnworks order landing). Railway
+#   cron handles the recurring schedule now (every 5 min).
 #   - workflow_dispatch: manual run with mode (observe/write) and
-#     optional limit; kept for ad-hoc dry runs and one-off backfills
-#     when a sale needs to land sooner than the next 30-min tick.
+#     optional limit; kept for ad-hoc dry runs, observe-mode
+#     debugging, and one-off backfills.
 # Concurrency group below ensures only one pull runs at a time so a
-# slow run can't overlap with the next cron tick.
+# manual run can't overlap with another in-flight invocation.
 on:
-  schedule:
-    - cron: '*/30 * * * *'
+  # schedule:
+  #   - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       mode:

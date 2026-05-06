@@ -1,15 +1,14 @@
 name: Sync — Linnworks → Square
 
-# Two triggers:
-#   - schedule: every 30 min, always --write, no limit (the cron sync).
+# Scheduling moved to Railway. Manual triggers via workflow_dispatch only.
 #   - workflow_dispatch: manual run with mode (observe/write) and
-#     optional limit; defaults to observe (the legacy behaviour, kept
-#     for ad-hoc dry runs and staged rollouts).
+#     optional limit; defaults to observe (kept for ad-hoc dry runs,
+#     observe-mode debugging, and one-off staged rollouts).
 # Concurrency group below ensures only one sync runs at a time so a
-# slow run can't overlap with the next cron tick.
+# manual run can't overlap with another in-flight invocation.
 on:
-  schedule:
-    - cron: '*/30 * * * *'
+  # schedule:
+  #   - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       mode:
