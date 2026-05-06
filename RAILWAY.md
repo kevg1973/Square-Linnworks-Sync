@@ -1,6 +1,9 @@
 # Railway Deployment
 
-Two scheduled crons run on Railway:
+Two scheduled crons run on Railway, each as its own service in the same
+project. Both share the same Docker image (built from the repo root
+`Dockerfile`) but specify different start commands and cron schedules
+via their respective config files:
 
 | Tool | Schedule | Config file |
 |------|----------|-------------|
@@ -9,15 +12,10 @@ Two scheduled crons run on Railway:
 
 ## Setup
 
-Each tool gets its own Railway service in the same project, both pointing
-at this GitHub repo on `main` branch.
-
-When creating each service:
-1. Source: GitHub repo, branch `main`
-2. In Settings → Config-as-code path, set the appropriate file:
-   - sync service: `railway.sync.json`
-   - pull service: `railway.pull.json`
-3. Add the 7 environment variables from `.env.example`
-
-Once both services build green and run their first cron successfully,
-the migration is complete.
+1. Create a new Railway service from this GitHub repo (`main` branch).
+2. In Settings → Build, ensure builder is "Dockerfile" (or auto-detected).
+3. In Settings → Source, set "Config-as-code path" to either:
+   - `railway.sync.json` (for the sync service), or
+   - `railway.pull.json` (for the pull service)
+4. Add the 7 environment variables (see `.env.example`).
+5. Wait for the build to succeed and the cron to register.
