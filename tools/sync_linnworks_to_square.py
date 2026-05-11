@@ -128,7 +128,16 @@ def _fetch_lw_page(page_number: int) -> list[dict[str, Any]]:
         "dataRequirements": [0, 1, 2],
         "searchTypes": [],
     }
-    result = linnworks.call("Stock/GetStockItemsFull", json_body=body)
+    try:
+        result = linnworks.call("Stock/GetStockItemsFull", json_body=body)
+    except requests.HTTPError as e:
+        # Linnworks signals end-of-pagination with HTTP 400 when you
+        # walk one page off the end. Treat that as an empty page so
+        # the caller stops cleanly. A 400 on page 1 means the request
+        # body itself is wrong — re-raise so it surfaces loudly.
+        if e.response is not None and e.response.status_code == 400 and page_number > 1:
+            return []
+        raise
     if isinstance(result, list):
         return result
     if isinstance(result, dict):
@@ -146,14 +155,12 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
     tenant and we handle both:
 
       1. Partial page (fewer than entriesPerPage items returned).
-         This is the primary signal — stop cleanly after processing it.
-      2. HTTP 400 on a page request that goes off the end. This is
-         the belt-and-suspenders — we shouldn't normally reach it
-         once #1 stops us, but if a catalog total happens to land
-         exactly on a page boundary we'd request one page too many.
-         Treated as expected ONLY if we've pulled ≥1 page AND the
-         previous page was already partial. A 400 anywhere else
-         (page 1, or after a full page) is a real error and re-raises.
+         The common case — stop cleanly after processing it.
+      2. HTTP 400 on a page that walks off the end. Hit when the
+         catalog total is an exact multiple of entriesPerPage, so
+         the previous page was full and we ask for one more. Handled
+         inside _fetch_lw_page (returns []) — that path falls through
+         to the empty-page break below.
     """
     items: list[dict[str, Any]] = []
     skipped_no_sku = 0
@@ -161,27 +168,10 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
     skipped_category_excluded = 0
     skipped_skulist = 0
     skipped_no_price = 0
-    prev_page_count: Optional[int] = None
 
     for page_number in range(1, LW_PAGE_SAFETY_CAP + 1):
         print(f"\n--- Linnworks page {page_number} ---")
-        try:
-            page_items = _fetch_lw_page(page_number)
-        except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else 0
-            if (
-                status == 400
-                and page_number > 1
-                and prev_page_count is not None
-                and prev_page_count < LW_ENTRIES_PER_PAGE
-            ):
-                print(
-                    f"    page {page_number} returned HTTP 400 — expected "
-                    f"end-of-catalog 400 (previous page was partial: "
-                    f"{prev_page_count} < {LW_ENTRIES_PER_PAGE}). Stopping cleanly."
-                )
-                break
-            raise
+        page_items = _fetch_lw_page(page_number)
 
         if not page_items:
             print(f"    page {page_number} empty — Linnworks pull complete")
@@ -233,7 +223,6 @@ def _pull_linnworks_items() -> list[dict[str, Any]]:
                 "linnworks_item_id": lw_item_id,
             })
 
-        prev_page_count = len(page_items)
         if len(page_items) < LW_ENTRIES_PER_PAGE:
             print(
                 f"    page {page_number} partial ({len(page_items)} < "
