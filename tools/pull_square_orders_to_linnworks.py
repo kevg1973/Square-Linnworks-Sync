@@ -741,10 +741,26 @@ def main(argv: Optional[list[str]] = None) -> int:
             pk = _create_linnworks_order(payload)
         except Exception as e:
             msg = f"CreateOrders failed: {e}"
-            _log_per_order_error(sq_id, msg, {"step": "create"})
+            _log_per_order_error(
+                sq_id,
+                msg,
+                {
+                    "step": "create",
+                    "order_item_skus": [
+                        it.get("SKU") for it in payload.get("OrderItems", [])
+                    ],
+                },
+            )
             error_messages.append(f"{sq_id}: {msg}")
             failed.append((order, msg))
-            print(f"  ✗ {sq_id} create failed → {str(e)[:200]}")
+            print(f"  ✗ {sq_id} create failed → {str(e)[:800]}")
+            # Dump the exact payload Linnworks rejected as ONE atomic
+            # block. Logged this way, a "was the JSON malformed?"
+            # question is answerable straight from the run log — the
+            # serialized object here is exactly what went on the wire.
+            print("    ----- payload Linnworks rejected (atomic dump) -----")
+            print(json.dumps({"orders": [payload]}, indent=2, default=str))
+            print("    ----------------------------------------------------")
             continue
         created_count += 1
         print(f"  ✓ {sq_id} created → pkOrderID {pk}")

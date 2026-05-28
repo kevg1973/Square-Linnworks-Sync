@@ -127,7 +127,18 @@ def call(
                 "ApplicationSecret may be wrong."
             )
 
-    resp.raise_for_status()
+    if not resp.ok:
+        # Surface Linnworks' response body in the error. Without this,
+        # callers only see "400 Client Error: Bad Request for url ..."
+        # and lose the actual validation message Linnworks returns in
+        # the body — the one thing that explains *why* a CreateOrders
+        # (or any) call was rejected.
+        body = (resp.text or "").strip()[:2000]
+        raise requests.HTTPError(
+            f"{resp.status_code} {resp.reason} for {url} — "
+            f"Linnworks response body: {body!r}",
+            response=resp,
+        )
     if not resp.content:
         return None
     return resp.json()
