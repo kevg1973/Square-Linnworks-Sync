@@ -71,9 +71,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+import requests
 
 from lib import db, linnworks, square
 
@@ -92,6 +95,18 @@ ORDER_PAGE_LIMIT = 100
 SKU_MAP_PAGE_SIZE = 1000
 PROCESSED_LOOKUP_CHUNK = 200
 PLAN_PREVIEW = 5
+
+# Failed-orders retry escalation. After this many failed CreateOrders
+# attempts an order is marked `stuck`, removed from auto-retry, and a
+# one-time email is sent for human triage. See sq_orders_failed.
+MAX_RETRY_ATTEMPTS = 5
+
+# Resend transactional-email API for stuck-order alerts. One HTTP POST
+# per escalation — no SDK dependency. Key in env (RESEND_API_KEY);
+# missing key degrades to a logged warning, never a crash.
+RESEND_API_URL = "https://api.resend.com/emails"
+STUCK_EMAIL_FROM = "alerts@northwestguitars.co.uk"
+STUCK_EMAIL_TO = "kevin@northwestguitars.co.uk"
 
 # Placeholder for fields the Square order doesn't supply. POS sales
 # rarely include a shipment recipient, so we fall back to the shop's
@@ -567,6 +582,232 @@ def _log_per_order_error(square_id: str, message: str, context: dict[str, Any]) 
     db.log_error(JOB_NAME, message, ctx)
 
 
+# ---------- failed-orders retry table ----------
+#
+# The watermark advances past failed orders (it tracks max(updated_at) of
+# *successful* orders), so a single failure in a batch where newer orders
+# succeed would be silently stranded forever. sq_orders_failed decouples
+# failed-order handling from the watermark: every failed CreateOrders is
+# captured here, re-attempted on every subsequent run, and escalated to a
+# human (stuck = TRUE + one email) only after MAX_RETRY_ATTEMPTS tries.
+
+
+def _send_stuck_order_email(failed_row: dict[str, Any]) -> bool:
+    """POST a one-time stuck-order alert to Resend. Returns True iff the
+    email was accepted (HTTP 2xx). Never raises — a missing key or a
+    Resend outage must not crash the cron; the caller leaves the row
+    stuck = TRUE with stuck_notified_at = NULL so we can notice later.
+    """
+    sq_id = failed_row.get("square_order_id") or "(unknown)"
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not api_key:
+        sys.stderr.write(
+            f"⚠ RESEND_API_KEY not set — skipping stuck-order email for {sq_id}\n"
+        )
+        return False
+
+    subject = (
+        f"[Square-Linnworks Sync] Order stuck after "
+        f"{MAX_RETRY_ATTEMPTS} failed attempts: {sq_id}"
+    )
+    body = (
+        "An order-pull from Square to Linnworks has failed "
+        f"{MAX_RETRY_ATTEMPTS} times and has been marked STUCK. It will no "
+        "longer be auto-retried and needs manual intervention.\n\n"
+        f"Square order ID : {sq_id}\n"
+        f"First failed at  : {failed_row.get('first_failed_at')}\n"
+        f"Last attempted   : {failed_row.get('last_attempted_at')}\n"
+        f"Attempts         : {failed_row.get('attempts')}\n\n"
+        f"Latest error:\n{failed_row.get('last_error')}\n\n"
+        "The full Square payload and the failure history are in the "
+        "sq_orders_failed table (WHERE stuck = TRUE). Full per-attempt "
+        "error context is in Railway's order-pull service logs.\n"
+    )
+    try:
+        resp = requests.post(
+            RESEND_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": STUCK_EMAIL_FROM,
+                "to": [STUCK_EMAIL_TO],
+                "subject": subject,
+                "text": body,
+            },
+            timeout=15,
+        )
+    except Exception as e:  # noqa: BLE001 — network/timeout must not crash the cron
+        sys.stderr.write(f"[stuck-order email POST FAILED for {sq_id}] {e}\n")
+        return False
+
+    if 200 <= resp.status_code < 300:
+        print(f"    ✉ stuck-order alert emailed to {STUCK_EMAIL_TO} for {sq_id}")
+        return True
+    sys.stderr.write(
+        f"[stuck-order email REJECTED for {sq_id}] HTTP {resp.status_code}: "
+        f"{getattr(resp, 'text', '')[:300]}\n"
+    )
+    return False
+
+
+def _notify_stuck(failed_row: dict[str, Any]) -> None:
+    """Send the stuck-order email and, only on success, stamp
+    stuck_notified_at so we never re-notify. A failed send leaves
+    stuck_notified_at NULL — the audit log / table surfaces the gap.
+    """
+    if _send_stuck_order_email(failed_row):
+        try:
+            (
+                db.client()
+                .table("sq_orders_failed")
+                .update({"stuck_notified_at": _now_iso()})
+                .eq("square_order_id", failed_row["square_order_id"])
+                .execute()
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[stuck_notified_at update FAILED for "
+                f"{failed_row.get('square_order_id')}] {e}\n"
+            )
+
+
+def _record_failed_order(square_id: str, message: str, order: dict[str, Any]) -> None:
+    """Upsert a CreateOrders failure into sq_orders_failed.
+
+    First failure inserts attempts = 1 with the full Square order JSON
+    (the canonical capture). A repeat failure increments attempts and
+    refreshes last_error / last_attempted_at WITHOUT overwriting the
+    stored JSON. When attempts reaches MAX_RETRY_ATTEMPTS for the first
+    time the row flips to stuck = TRUE and fires exactly one email.
+
+    Never raises — failure bookkeeping must not cascade into a crash.
+    """
+    now = _now_iso()
+    try:
+        existing = (
+            db.client()
+            .table("sq_orders_failed")
+            .select("square_order_id, attempts, stuck, first_failed_at")
+            .eq("square_order_id", square_id)
+            .limit(1)
+            .execute()
+        )
+        rows = existing.data or []
+        if rows:
+            row = rows[0]
+            attempts = (row.get("attempts") or 0) + 1
+            update: dict[str, Any] = {
+                "attempts": attempts,
+                "last_error": message[:2000] if message else None,
+                "last_attempted_at": now,
+            }
+            became_stuck = attempts >= MAX_RETRY_ATTEMPTS and not row.get("stuck")
+            if became_stuck:
+                update["stuck"] = True
+            (
+                db.client()
+                .table("sq_orders_failed")
+                .update(update)
+                .eq("square_order_id", square_id)
+                .execute()
+            )
+            print(
+                f"    ↻ recorded failure for {square_id} "
+                f"(attempt {attempts}/{MAX_RETRY_ATTEMPTS})"
+                + (" → STUCK" if became_stuck else "")
+            )
+            if became_stuck:
+                _notify_stuck({
+                    "square_order_id": square_id,
+                    "first_failed_at": row.get("first_failed_at"),
+                    "last_attempted_at": now,
+                    "attempts": attempts,
+                    "last_error": message,
+                })
+        else:
+            (
+                db.client()
+                .table("sq_orders_failed")
+                .insert({
+                    "square_order_id": square_id,
+                    "first_failed_at": now,
+                    "last_attempted_at": now,
+                    "attempts": 1,
+                    "last_error": message[:2000] if message else None,
+                    "square_order_json": order,
+                    "stuck": False,
+                })
+                .execute()
+            )
+            print(f"    ↻ recorded first failure for {square_id} (attempt 1/{MAX_RETRY_ATTEMPTS})")
+    except Exception as e:
+        sys.stderr.write(f"[sq_orders_failed upsert FAILED for {square_id}] {e}\n")
+
+
+def _clear_failed_order(square_id: str) -> None:
+    """Delete a resolved order from sq_orders_failed. Called on every
+    successful CreateOrders — the order is no longer failing, so its
+    retry row (if any) should go. A no-match delete is a harmless no-op.
+    """
+    try:
+        (
+            db.client()
+            .table("sq_orders_failed")
+            .delete()
+            .eq("square_order_id", square_id)
+            .execute()
+        )
+    except Exception as e:
+        sys.stderr.write(f"[sq_orders_failed delete FAILED for {square_id}] {e}\n")
+
+
+def _load_retry_orders() -> list[dict[str, Any]]:
+    """Return the reconstructed Square orders for every non-stuck row in
+    sq_orders_failed. Stuck rows are deliberately excluded — they sit for
+    human triage and never re-enter the auto-retry pass.
+    """
+    try:
+        resp = (
+            db.client()
+            .table("sq_orders_failed")
+            .select("square_order_id, square_order_json")
+            .eq("stuck", False)
+            .execute()
+        )
+    except Exception as e:
+        sys.stderr.write(f"[sq_orders_failed retry load FAILED] {e}\n")
+        return []
+    out: list[dict[str, Any]] = []
+    for r in resp.data or []:
+        oj = r.get("square_order_json")
+        if not oj:
+            continue
+        if not oj.get("id"):
+            oj["id"] = r.get("square_order_id")
+        out.append(oj)
+    return out
+
+
+def _count_stuck_orders() -> int:
+    """COUNT(*) of stuck rows in sq_orders_failed. Read once per run for
+    the audit row + end-of-run warning.
+    """
+    try:
+        resp = (
+            db.client()
+            .table("sq_orders_failed")
+            .select("square_order_id")
+            .eq("stuck", True)
+            .execute()
+        )
+        return len(resp.data or [])
+    except Exception as e:
+        sys.stderr.write(f"[sq_orders_failed stuck-count FAILED] {e}\n")
+        return 0
+
+
 def _write_audit_row(
     *,
     mode: str,
@@ -580,6 +821,9 @@ def _write_audit_row(
     orders_created: int,
     orders_unparked: int,
     orders_marked_paid: int,
+    orders_retried: int = 0,
+    orders_retry_succeeded: int = 0,
+    stuck_orders_count: int = 0,
     error_messages: list[str],
 ) -> None:
     summary = ""
@@ -600,6 +844,9 @@ def _write_audit_row(
         "orders_created":       orders_created,
         "orders_unparked":      orders_unparked,
         "orders_marked_paid":   orders_marked_paid,
+        "orders_retried":       orders_retried,
+        "orders_retry_succeeded": orders_retry_succeeded,
+        "stuck_orders_count":   stuck_orders_count,
         "error_summary":        summary[:1000] if summary else None,
     }
     try:
@@ -701,10 +948,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     new_orders = [o for o in new_orders if (o.get("line_items") or [])]
     skipped_empty_count = len(empty_orders)
 
+    # ---------- retry pass ----------
+    # Merge previously-failed orders (sq_orders_failed, non-stuck) into the
+    # to-process list, independent of the watermark. Dedup by square_order_id
+    # against the freshly-fetched orders so a recent failure that reappears
+    # in this fetch is processed exactly once. retry_ids tracks every retry
+    # origin (whether merged-in or already in the fetch) for audit counting.
+    retry_orders = _load_retry_orders()
+    retry_ids = {o.get("id") for o in retry_orders if o.get("id")}
+    fresh_ids = {o.get("id") for o in new_orders}
+    retry_only = [o for o in retry_orders if o.get("id") and o.get("id") not in fresh_ids]
+    if retry_orders:
+        print(
+            f"\n--- retry pass: {len(retry_orders)} non-stuck failed order(s) "
+            f"loaded ({len(retry_only)} merged in, "
+            f"{len(retry_orders) - len(retry_only)} already in this fetch) ---"
+        )
+        new_orders = new_orders + retry_only
+
     print(
         f"\n=== fetched={fetched}  to_process={len(new_orders)}  "
         f"already_processed={len(skipped_orders)}  "
-        f"skipped_empty={skipped_empty_count} ==="
+        f"skipped_empty={skipped_empty_count}  retry={len(retry_ids)} ==="
     )
     if empty_orders:
         for o in empty_orders[:PLAN_PREVIEW]:
@@ -727,6 +992,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ---------- observe → exit ----------
     if not args.write:
+        stuck_count = _count_stuck_orders()
         print(f"\n=== DRY RUN — no Linnworks writes performed, watermark unchanged. ===")
         _write_audit_row(
             mode=mode,
@@ -740,6 +1006,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             orders_created=0,
             orders_unparked=0,
             orders_marked_paid=0,
+            orders_retried=0,
+            orders_retry_succeeded=0,
+            stuck_orders_count=stuck_count,
             error_messages=[],
         )
         print(
@@ -749,6 +1018,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"watermark_before={watermark_before.isoformat()} watermark_after=(unchanged) "
             f"(observe mode) ==="
         )
+        if stuck_count:
+            print(
+                f"\n⚠ {stuck_count} stuck order(s) — manual intervention needed. "
+                f"See sq_orders_failed WHERE stuck = TRUE."
+            )
         return 0
 
     # ---------- write ----------
@@ -763,9 +1037,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     created_count = 0
     unparked_count = 0
     marked_paid_count = 0
+    retried_count = 0
+    retry_succeeded_count = 0
 
     for order in new_orders:
         sq_id = order.get("id") or "(no id)"
+
+        # A retry-origin order is one that was previously logged in
+        # sq_orders_failed. Counted separately for the audit row; success
+        # is tallied where the order lands in `successful` below.
+        is_retry = sq_id in retry_ids
+        if is_retry:
+            retried_count += 1
 
         # Build payload
         try:
@@ -795,6 +1078,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             error_messages.append(f"{sq_id}: {msg}")
             failed.append((order, msg))
+            # Capture / escalate in the failed-orders retry table. This is
+            # the watermark-skip fix: the order is now tracked independently
+            # of the watermark and re-attempted every run until it succeeds
+            # or escalates to stuck (+ a one-time email) at MAX_RETRY_ATTEMPTS.
+            _record_failed_order(sq_id, msg, order)
             print(f"  ✗ {sq_id} create failed → {str(e)[:800]}")
             # Dump the exact payload Linnworks rejected as ONE atomic
             # block. Logged this way, a "was the JSON malformed?"
@@ -805,6 +1093,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("    ----------------------------------------------------")
             continue
         created_count += 1
+        # CreateOrders succeeded — the order resolved itself, so drop any
+        # retry row it had. No-op if it was never in sq_orders_failed.
+        _clear_failed_order(sq_id)
         print(f"  ✓ {sq_id} created → pkOrderID {pk}")
 
         # Step 2 — unpark. Failure here means the order exists in
@@ -856,6 +1147,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             error_messages.append(f"{sq_id}: bookkeeping insert failed: {e}")
 
         successful.append((order, pk))
+        if is_retry:
+            retry_succeeded_count += 1
 
     # ---------- watermark ----------
     watermark_after: Optional[datetime] = None
@@ -876,6 +1169,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 watermark_after = None
 
     # ---------- audit + summary ----------
+    stuck_count = _count_stuck_orders()
     _write_audit_row(
         mode=mode,
         watermark_before=watermark_before,
@@ -888,18 +1182,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         orders_created=created_count,
         orders_unparked=unparked_count,
         orders_marked_paid=marked_paid_count,
+        orders_retried=retried_count,
+        orders_retry_succeeded=retry_succeeded_count,
+        stuck_orders_count=stuck_count,
         error_messages=error_messages,
     )
 
+    retry_summary = (
+        f" retried={retried_count} retry_succeeded={retry_succeeded_count}"
+        if retried_count
+        else ""
+    )
     print("\n" + "=" * 70)
     print(
         f"=== PULL COMPLETE: fetched={fetched} processed={len(successful)} "
         f"skipped={len(skipped_orders)} skipped_empty={skipped_empty_count} failed={len(failed)} "
-        f"created={created_count} unparked={unparked_count} marked_paid={marked_paid_count} "
+        f"created={created_count} unparked={unparked_count} marked_paid={marked_paid_count}"
+        f"{retry_summary} "
         f"watermark_before={watermark_before.isoformat()} "
         f"watermark_after={watermark_after.isoformat() if watermark_after else '(unchanged)'} ==="
     )
     print("=" * 70)
+    if stuck_count:
+        print(
+            f"\n⚠ {stuck_count} stuck order(s) — manual intervention needed. "
+            f"See sq_orders_failed WHERE stuck = TRUE."
+        )
 
     return 0 if not failed else 1
 

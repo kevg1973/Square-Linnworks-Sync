@@ -835,6 +835,56 @@ A common failure pattern is partial success: step 1 lands but step 2 or 3 fails 
 - **On retry**, step 1 re-creates with the same `(Source, SubSource, ReferenceNumber)` triple → Linnworks dedup returns the same `pkOrderID` → cheap. Steps 2 and 3 are idempotent against an already-unparked / already-paid order (no error if state is already there).
 - **Log per-step success/failure** so you can diagnose stuck orders. A recurring "create OK, unpark failed" pattern points at a tenant config issue (e.g. an order tag that requires special permissions to remove).
 
+### Handling persistent failures — the retry table pattern
+
+Retry-on-next-run (above) is only safe while the failing order stays
+*in the pull window*. The order-pull watermark advances to
+`max(updated_at)` of the **successful** orders in a batch — so if one
+order fails while newer orders in the same batch succeed, the watermark
+drags past the failure and it's never re-fetched. It's silently
+stranded forever. (Observed live: Square order `dCxw8888…` failed
+Linnworks' duplicate-SKU validation while later orders succeeded; the
+watermark skipped it.)
+
+The fix is a dedicated retry table, `sq_orders_failed`, that decouples
+failed-order handling from the watermark entirely:
+
+| Column | Role |
+|---|---|
+| `square_order_id` (PK) | Idempotency key — one row per failing order. |
+| `first_failed_at` / `last_attempted_at` | Failure window for triage. |
+| `attempts` | Incremented on every re-failure. |
+| `last_error` | Most recent error message. |
+| `square_order_json` | The full Square order, captured on **first** failure (canonical — never overwritten). Lets the cron re-attempt without re-fetching from Square. |
+| `stuck` | `TRUE` once `attempts >= 5`. Removes the order from auto-retry. |
+| `stuck_notified_at` | Stamped when the one-time escalation email succeeds. |
+
+**Flow:**
+
+1. **On a CreateOrders failure** — upsert the order into
+   `sq_orders_failed`. First failure inserts `attempts = 1` + the full
+   JSON; a repeat failure increments `attempts` and refreshes
+   `last_error` / `last_attempted_at` *without* overwriting the stored
+   JSON.
+2. **Retry pass** — at the start of every run, after the normal Square
+   fetch, load all non-stuck rows, reconstruct each order from
+   `square_order_json`, and merge them into the to-process list (dedup
+   by `square_order_id` against the fresh fetch). They flow through the
+   exact same build/create path as fresh orders.
+3. **On a CreateOrders success** — `DELETE` the row. The order resolved
+   itself; the table only holds genuinely-failing orders.
+4. **Escalation** — the moment `attempts` reaches **5**, flip
+   `stuck = TRUE`, send **one** alert email (via Resend) and stop
+   auto-retrying. Stuck rows are excluded from the retry pass and sit
+   for human triage. The email fires exactly once per stuck order
+   (guarded by the `stuck` flag transition, recorded by
+   `stuck_notified_at`).
+
+The watermark logic is **unchanged** — it still advances on
+`max(updated_at)` of successful orders. That's the point: the retry
+table makes the watermark free to advance without ever stranding a
+failure.
+
 ---
 
 ## 9. Stock processing flow

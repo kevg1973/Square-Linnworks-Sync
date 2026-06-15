@@ -206,6 +206,13 @@ SUPABASE_URL              (https://miicdzowfzxffnorlqzp.supabase.co)
 SUPABASE_SERVICE_KEY
 ```
 
+**Optional (8th)**: `RESEND_API_KEY` — used only by the order-pull
+service to send stuck-order alert emails via Resend
+(`alerts@northwestguitars.co.uk` → `kevin@northwestguitars.co.uk`). If
+unset, the pull cron logs a warning and continues — stuck orders still
+land in `sq_orders_failed`, just without the email nudge. Set it on the
+Railway `pull` service to enable notifications.
+
 - **GitHub Actions**: repository secrets in Settings → Secrets and
   variables → Actions. Used by manual `workflow_dispatch` runs (sync,
   pull, probes, wipe).
@@ -271,6 +278,19 @@ Sequence (chronology in git log):
 
 **Active issues**:
 
+- **Watermark-skip stranding failed orders — RESOLVED** via the
+  `sq_orders_failed` retry table (migration `003_*.sql`). The order-pull
+  watermark advances to `max(updated_at)` of the *successful* orders, so
+  a single failure in a batch where newer orders succeeded was dragged
+  past and silently stranded forever (hit live with `dCxw8888…`, which
+  failed Linnworks' duplicate-SKU check). Now every CreateOrders failure
+  is captured in `sq_orders_failed` and re-attempted every run
+  independently of the watermark, until it succeeds (row deleted) or
+  escalates to `stuck = TRUE` after 5 attempts (auto-retry stops, one
+  Resend email to Kevin, sits for manual triage). The watermark logic is
+  unchanged — decoupling is the whole point. **Remaining step**: apply
+  migrations `002_*.sql` **and** `003_*.sql` in the Supabase SQL editor
+  before relying on the retry system in production.
 - **`sq_orders_pull_log` `orders_skipped_empty` PGRST204 — RESOLVED**
   (pending manual apply of `002_*.sql` to the live DB). Root cause was
   **schema drift, not a stale cache**: `001_initial.sql` was edited to
@@ -528,6 +548,7 @@ All prefixed `sq_` to avoid collision with the host project.
 | `sq_sku_map` | Spine intended for sync caching. One row per SKU; links Linnworks `StockItemId` to Square `catalog_object_id` + `variation_id`; caches `last_known_stock` and `last_known_price` for no-op skipping. **Not yet populated** — sync still re-derives the mapping from a catalog walk on every run. |
 | `sq_sync_runs` | One row per cron execution (job_name, started_at, finished_at, status, items_processed/changed/errors, github_run_url). Used by `lib/db.py` `sync_run_start`/`sync_run_finish`. **Not the same as `sq_lw_sync_log`** — different shape and lifecycle. |
 | `sq_square_orders_processed` | Idempotency for order-pull. Keyed on Square's `order_id`. |
+| `sq_orders_failed` | Failed-orders retry table (migration `003`). One row per Square order that failed `CreateOrders`, keyed on `square_order_id`. Holds the canonical `square_order_json`, `attempts`, `last_error`, and `stuck` flag. Re-attempted every pull run independently of the watermark until success (row deleted) or escalation to `stuck = TRUE` at 5 attempts (one Resend email, then human triage). This is the watermark-skip fix — see backlog. |
 | `sq_orders_pull_log` | Audit row per order-pull run (orders pulled / created / skipped / etc.). The `orders_skipped_empty` PGRST204 insert failure was schema drift, fixed by `002_*.sql` (pending live apply) — see backlog. |
 | `sq_errors` | Per-error log for non-fatal failures during a sync run. |
 | `sq_watermarks` | Key-value cursors (e.g. `square_orders_last_pulled_at`). |
