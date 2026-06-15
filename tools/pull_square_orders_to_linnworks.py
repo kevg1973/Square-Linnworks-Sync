@@ -428,6 +428,44 @@ def _build_order_items(
     return items
 
 
+def _merge_duplicate_skus(order_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Linnworks Orders/CreateOrders rejects orders containing duplicate SKUs
+    across line items (it returns e.g. "LineId: SPR22 is duplicated"). Square
+    allows the same product to be rung up as multiple separate lines. Merge
+    same-SKU lines into one with combined qty, deriving PricePerUnit from the
+    summed line totals so per-line price variations (e.g. a partial discount
+    on one line) are preserved correctly.
+
+    The merge key is the SKU itself, so it also collapses service / unmapped
+    lines that fell back to title-as-SKU — exactly the right behaviour, since
+    Linnworks' duplicate check is on the SKU value regardless of stock-link
+    status.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for item in order_items:
+        sku = item["SKU"]
+        if sku in merged:
+            existing = merged[sku]
+            combined_qty = existing["Qty"] + item["Qty"]
+            # Sum each line's own total (qty × price) before dividing, so
+            # differing per-unit prices across the same-SKU lines average
+            # out by value rather than by a naive per-unit mean.
+            combined_total = (
+                existing["Qty"] * existing["PricePerUnit"]
+                + item["Qty"] * item["PricePerUnit"]
+            )
+            existing["Qty"] = combined_qty
+            existing["PricePerUnit"] = round(combined_total / combined_qty, 4)
+            print(
+                f"    [merge] combined duplicate SKU '{sku}' → "
+                f"qty {combined_qty} @ £{existing['PricePerUnit']}"
+            )
+        else:
+            merged[sku] = item
+    return list(merged.values())
+
+
 def _build_linnworks_payload(
     order: dict[str, Any],
     sku_map: dict[str, dict[str, Optional[str]]],
@@ -438,6 +476,10 @@ def _build_linnworks_payload(
     received = _parse_iso(order.get("created_at")) or _now_utc()
     dispatch_by = received + timedelta(days=2)
     address = _build_address(order)
+
+    order_items = _merge_duplicate_skus(
+        _build_order_items(order, sku_map, verbose=verbose)
+    )
 
     return {
         "Source":                  "SQUAREPOS",
@@ -458,7 +500,7 @@ def _build_linnworks_payload(
         # product/category defaults. Set at both order and
         # line-item level per Linnworks API docs.
         "UseChannelTax":           True,
-        "OrderItems":              _build_order_items(order, sku_map, verbose=verbose),
+        "OrderItems":              order_items,
         "DeliveryAddress":         address,
         "BillingAddress":          dict(address),
     }

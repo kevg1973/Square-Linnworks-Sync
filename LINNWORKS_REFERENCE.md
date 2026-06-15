@@ -588,6 +588,21 @@ Field-by-field notes:
 - **`isService`** — `true` for service / non-stock-tracked lines. Tells Linnworks not to attempt stock linking and not to decrement on processing. `false` for real stock items.
 - **`TaxRate`** — VAT rate as a percentage integer (`20` for UK standard, `0` for exempt). See §11.
 
+### Duplicate SKUs across line items — rejected
+
+`Orders/CreateOrders` **rejects an order where the same SKU appears on more than one `OrderItem`**. Each SKU must appear on exactly one line, with the quantity summed. The rejection is an HTTP 400 with a body like:
+
+```json
+{"Code": null,
+ "Message": "Orders have invalid values: Order: <orderId>, LineId: <SKU> is duplicated"}
+```
+
+(Observed live on order `dCxw8888clDsEA5t5SbkvNcOaFEZY`: SKU `SPR22` rang up on two separate Square POS lines.)
+
+If your source system (e.g. a POS till) allows the same item to be rung up on multiple separate lines, **merge same-SKU lines before sending**: combine into one `OrderItem` with the summed `Qty`, and derive `PricePerUnit` from the *summed line totals* (Σ `Qty × PricePerUnit` ÷ Σ `Qty`) rather than a naive per-unit mean — that preserves correctness when one line carried a partial discount. The merge key is the SKU value itself, so it applies equally to title-as-SKU fallback lines for services / ad-hoc items; the duplicate check is on the SKU string regardless of stock-link status.
+
+In this repo, `tools/pull_square_orders_to_linnworks.py` does exactly this via `_merge_duplicate_skus()`, called in `_build_linnworks_payload` just before the `OrderItems` list is finalised. Proof test: `tests/test_merge_duplicate_skus.py`.
+
 ### Strong-link vs weak-link
 
 There are three states a line item can land in:
