@@ -271,12 +271,17 @@ Sequence (chronology in git log):
 
 **Active issues**:
 
-- **PostgREST schema cache flush** — `sq_orders_pull_log` insert is
-  recurring-failing for the `orders_skipped_empty` column. Likely a
-  schema mismatch between the table definition and what the tool is
-  trying to write. Fix path: confirm the column exists in
-  `supabase/001_initial.sql`, paste the migration into the Supabase
-  SQL Editor, then run `NOTIFY pgrst, 'reload schema';`.
+- **`sq_orders_pull_log` `orders_skipped_empty` PGRST204 — RESOLVED**
+  (pending manual apply of `002_*.sql` to the live DB). Root cause was
+  **schema drift, not a stale cache**: `001_initial.sql` was edited to
+  add the `orders_skipped_empty` column *after* it had already been
+  applied to the live database, so the column landed in the source file
+  but never on the live table. PostgREST was correctly reporting that
+  the column doesn't exist (PGRST204) — no amount of `NOTIFY`-based
+  cache reloads would have helped. Fix: `supabase/002_add_orders_skipped_empty.sql`
+  (idempotent `ADD COLUMN IF NOT EXISTS` + `NOTIFY`). **Remaining step**:
+  Kevin pastes `002_*.sql` into the Supabase SQL editor and runs it;
+  then close this item. See *Migration discipline* below for the lesson.
 - **Categories on Square items** — POS usability. Sync currently
   doesn't push categories; staff see a flat item list at the till.
 - **Service order end-to-end test** — the `isService` flag on
@@ -322,12 +327,13 @@ Sequence (chronology in git log):
   check the Supabase dashboard and unpause if needed.
 - **Linnworks**: rate limit ~1 req/sec, auth header is the raw token
   (no `Bearer` prefix), 401 → re-auth + retry once.
-- **After modifying `supabase/001_initial.sql`**: paste into the
-  Supabase SQL editor and run it (idempotent — every CREATE uses
-  `IF NOT EXISTS`), **then** run `NOTIFY pgrst, 'reload schema';` so
-  PostgREST sees new tables. Without the NOTIFY, audit inserts will
-  fail with `PGRST205` for ~minutes until the cache naturally
-  refreshes.
+- **Applying a migration**: paste the SQL into the Supabase SQL editor
+  and run it (idempotent — every statement uses `IF NOT EXISTS`),
+  **then** run `NOTIFY pgrst, 'reload schema';` so PostgREST sees the
+  change. Without the NOTIFY, audit inserts will fail with `PGRST205`
+  for ~minutes until the cache naturally refreshes. **New schema
+  changes go in a new numbered file, not by editing an already-applied
+  one** — see *Migration discipline*.
 - **Railway env vars are per-service.** When rotating a secret,
   update **both** Railway services AND the GitHub Actions repo
   secrets. The two stacks share no env state.
@@ -340,6 +346,16 @@ Sequence (chronology in git log):
   working reference (auth, gotchas, the
   `Dashboards/ExecuteCustomPagedScript` form-encoding trick, etc.).
   Read it before writing new Linnworks endpoint code.
+
+## Migration discipline
+
+- **Never edit a migration that has already been applied to a live
+  database.** Migrations are append-only — additions go in a new
+  numbered file (`002_*.sql`, `003_*.sql`, ...). Editing an applied
+  migration creates silent schema drift between code and database that
+  PostgREST will report ambiguously (e.g. the `orders_skipped_empty`
+  PGRST204 that masqueraded as a stale-cache problem for the whole
+  Railway era — see backlog).
 
 ## Working method (Kevin's preference)
 
@@ -512,7 +528,7 @@ All prefixed `sq_` to avoid collision with the host project.
 | `sq_sku_map` | Spine intended for sync caching. One row per SKU; links Linnworks `StockItemId` to Square `catalog_object_id` + `variation_id`; caches `last_known_stock` and `last_known_price` for no-op skipping. **Not yet populated** — sync still re-derives the mapping from a catalog walk on every run. |
 | `sq_sync_runs` | One row per cron execution (job_name, started_at, finished_at, status, items_processed/changed/errors, github_run_url). Used by `lib/db.py` `sync_run_start`/`sync_run_finish`. **Not the same as `sq_lw_sync_log`** — different shape and lifecycle. |
 | `sq_square_orders_processed` | Idempotency for order-pull. Keyed on Square's `order_id`. |
-| `sq_orders_pull_log` | Audit row per order-pull run (orders pulled / created / skipped / etc.). Currently has a recurring `orders_skipped_empty` insert failure — see backlog. |
+| `sq_orders_pull_log` | Audit row per order-pull run (orders pulled / created / skipped / etc.). The `orders_skipped_empty` PGRST204 insert failure was schema drift, fixed by `002_*.sql` (pending live apply) — see backlog. |
 | `sq_errors` | Per-error log for non-fatal failures during a sync run. |
 | `sq_watermarks` | Key-value cursors (e.g. `square_orders_last_pulled_at`). |
 | `sq_wipe_log` | Audit row per wipe-tool run (observe or write). UUID PK, mode, walked/deleted/failed/kept counts, error_summary. |
