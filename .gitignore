@@ -33,3 +33,4 @@ discoveries-draft.md
 # Workflow run artefacts (we download these manually, don't commit)
 *.csv
 !supabase/*.csv
+.Rhistory
